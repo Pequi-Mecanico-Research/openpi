@@ -28,6 +28,8 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
+import openpi.policies.widowx_policy as widowx_policy
+
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
@@ -353,6 +355,45 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotWidowXDataConfig(DataConfigFactory):
+    """
+    Config de dados para o dataset WidowX AI (3 câmeras: cam_main, cam_wrist, cam_low; 7 DOF).
+    """
+ 
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.cam_main",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/low_image": "observation.images.cam_low",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+ 
+        data_transforms = _transforms.Group(
+            inputs=[widowx_policy.WidowXInputs(model_type=model_config.model_type)],
+            outputs=[widowx_policy.WidowXOutputs()],
+        )
+ 
+        model_transforms = ModelTransformFactory()(model_config)
+ 
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+ 
+
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -630,6 +671,52 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
+    ),
+    TrainConfig(
+        name="pi05_base",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            # Aponte diretamente para o diretório de assets do modelo base na nuvem
+            # Isso garante que ele pegue as estatísticas de normalização do pi05_base
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen"
+            ),
+            data_transforms=lambda model: _transforms.Group(
+                # Substituímos as políticas do DROID pelas do ALOHA (padrão Trossen)
+                inputs=[aloha_policy.AlohaInputs()],
+                outputs=[aloha_policy.AlohaOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+
+    TrainConfig(
+        name="pi05_widowxai_organize_table",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotWidowXDataConfig(
+            repo_id="jv-costa/widowxai-organize-the-table-cube002-v21",
+            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,   # == num_train_steps
+            decay_lr=1e-6,
+        ),
+        num_train_steps=20_000,
+        batch_size=8,
+        num_workers=8,
+        save_interval=1_000,
+        keep_period=4_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Libero configs.
