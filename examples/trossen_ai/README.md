@@ -190,9 +190,14 @@ The client will connect to the policy server and perform the specified task usin
 You can change the cameras and arm ip address in the script `examples/trossen_ai/main.py` by editing
 
 ```python
+<<<<<<< Updated upstream
 robot_config = BiWidowXAIFollowerRobotConfig(
             id="bimanual_follower",
             left_arm_ip_address="192.168.1.5",
+=======
+bi_widowx_ai_config = BiWidowXAIFollowerConfig(
+            left_arm_ip_address="192.168.1.23",
+>>>>>>> Stashed changes
             right_arm_ip_address="192.168.1.4",
             min_time_to_move_multiplier=4.0,
             loop_rate=30,
@@ -216,6 +221,10 @@ robot_config = BiWidowXAIFollowerRobotConfig(
             }
         )
 ```
+
+# Run de code 
+
+uv run main.py --policy_host 192.168.0.187 --policy_port 8000 --mode test --max_steps 5 --task_prompt "grab and handover green cube"
 
 The client script provides parameters to control both the **rate of inference** and **temporal ensembling**.
 

@@ -24,6 +24,7 @@ import time
 import cv2
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.robots import make_robot_from_config
+from lerobot_robot_trossen.config_widowxai_follower import WidowXAIFollowerConfig
 from lerobot_robot_trossen.config_bi_widowxai_follower import BiWidowXAIFollowerRobotConfig
 import numpy as np
 from openpi_client import websocket_client_policy
@@ -54,34 +55,46 @@ class TrossenOpenPIBridge:
             host=policy_server_host, port=policy_server_port
         )
 
-        robot_config = BiWidowXAIFollowerRobotConfig(
-            id="bimanual_follower",
-            left_arm_ip_address="192.168.1.5",
-            right_arm_ip_address="192.168.1.4",
+        robot_config = WidowXAIFollowerConfig(
+            id="Clear_Table_Task",
+            ip_address="192.168.1.2",
             min_time_to_move_multiplier=4.0,
             loop_rate=30,
             cameras={
                 "cam_high": RealSenseCameraConfig(
-                    serial_number_or_name="218622270304", width=640, height=480, fps=30, use_depth=False
+                    serial_number_or_name="944122073060", width=640, height=480, fps=30, use_depth=False
+                ),
+                "cam_wrist": RealSenseCameraConfig(
+                    serial_number_or_name="243322072096", width=640, height=480, fps=30, use_depth=False
                 ),
                 "cam_low": RealSenseCameraConfig(
-                    serial_number_or_name="130322272628", width=640, height=480, fps=30, use_depth=False
-                ),
-                "cam_right_wrist": RealSenseCameraConfig(
-                    serial_number_or_name="128422271347", width=640, height=480, fps=30, use_depth=False
-                ),
-                "cam_left_wrist": RealSenseCameraConfig(
-                    serial_number_or_name="218622274938", width=640, height=480, fps=30, use_depth=False
+                    serial_number_or_name="102122061119", width=640, height=480, fps=30, use_depth=False
                 ),
             },
         )
+        
+        """robot_config = BiWidowXAIFollowerRobotConfig(
+            left_arm_ip_address="192.168.1.23",
+            right_arm_ip_address="192.168.1.24",
+            min_time_to_move_multiplier=4.0,
+            id="bimanual_follower",
+            cameras={
+                "cam_high": RealSenseCameraConfig(
+                    serial_number_or_name="235422300510", width=640, height=480, fps=30, use_depth=False
+                ),
+                "cam_right_wrist": RealSenseCameraConfig(
+                    serial_number_or_name="243322072096", width=640, height=480, fps=30, use_depth=False
+                ),
+            },
+        )"""
+        
         self.robot = make_robot_from_config(robot_config)
         self.robot.connect()
 
         self.current_action_chunk = None
         self.action_chunk_idx = 0
         self.action_chunk_size = (
-            50  # Number of actions per chunk from the policy (Defined by the policy server in this case 50)
+            30  # Number of actions per chunk from the policy (Defined by the policy server in this case 50)
         )
         self.episode_step = 0
         self.is_running = False
@@ -170,9 +183,17 @@ class TrossenOpenPIBridge:
                     observation_dict[cam] = image_chw
 
                 # Create observation for policy to follow the ALOHA format
-                observation = {
+                """observation = {
                     "state": joint_positions,
                     "images": {cam: observation_dict[cam] for cam in cameras},
+                    "prompt": task_prompt,
+                }"""
+                
+                observation = {
+                    "observation/state": joint_positions,
+                    "observation/image": observation_dict["cam_high"],
+                    "observation/wrist_image": observation_dict["cam_wrist"],
+                    "observation/low_image": observation_dict["cam_low"],
                     "prompt": task_prompt,
                 }
 
@@ -259,6 +280,9 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
     )
 
-    bridge.autonomous_mode(task_prompt=args.task_prompt)
-
-    bridge.cleanup()
+    try:
+        bridge.autonomous_mode(task_prompt=args.task_prompt)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, returning arm to start position...")
+    finally:
+        bridge.cleanup()
