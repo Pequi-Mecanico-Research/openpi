@@ -358,16 +358,16 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 @dataclasses.dataclass(frozen=True)
 class LeRobotWidowXDataConfig(DataConfigFactory):
     """
-    Config de dados para o dataset WidowX AI (3 câmeras: cam_main, cam_wrist, cam_low; 7 DOF).
+    Config de dados para o dataset WidowX AI (3 câmeras: cam_high, cam_wrist, cam_low; 7 DOF).
     """
- 
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "observation.images.cam_main",
+                        "observation/image": "observation.images.cam_high",
                         "observation/wrist_image": "observation.images.cam_wrist",
                         "observation/low_image": "observation.images.cam_low",
                         "observation/state": "observation.state",
@@ -695,9 +695,10 @@ _CONFIGS = [
 
     TrainConfig(
         name="pi05_widowxai_organize_table",
+        exp_name="pi05_organize_cube_with_effort",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotWidowXDataConfig(
-            repo_id="jv-costa/widowxai-organize-the-table-cube002-v21",
+            repo_id="Guilhermefrazao/widowxai-organize-the-table-effort-v21",
             # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
             base_config=DataConfig(prompt_from_task=True),
         ),
@@ -708,15 +709,26 @@ _CONFIGS = [
             decay_steps=20_000,   # == num_train_steps
             decay_lr=1e-6,
         ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1,
+        ),
+        ema_decay=None,
+        batch_size=16,
+        num_workers=4,
         num_train_steps=20_000,
-        batch_size=8,
-        num_workers=8,
+        log_interval=100,
         save_interval=1_000,
         keep_period=4_000,
+        wandb_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
-        ema_decay=None,
+        policy_metadata=None,
+        fsdp_devices=1,
     ),
     #
     # Fine-tuning Libero configs.
