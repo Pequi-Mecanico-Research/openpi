@@ -93,20 +93,17 @@ class TrossenOpenPIBridge:
 
         self.current_action_chunk = None
         self.action_chunk_idx = 0
-        self.action_chunk_size = (
-            30  # Number of actions per chunk from the policy (Defined by the policy server in this case 50)
-        )
         self.episode_step = 0
         self.is_running = False
-        self.rate_of_inference = 50  # Number of control steps per policy inference (matches README and Pi-0 paper)
+        self.rate_of_inference = 50 # Number of control steps per policy inference (matches README and Pi-0 paper)
 
-        self.temporal_ensemble_coefficient = None  # Temporal ensembling weight (can be set to None for no ensembling)
+        self.temporal_ensemble_coefficient = None  #Testar 0.01 # Temporal ensembling weight (can be set to None for no ensembling)
 
         # FIFO Buffer for actions
         self.action_buffer = defaultdict(list)
         self.action_buffer_size = (
-            self.max_steps + self.action_chunk_size
-        )  # Buffer size to hold actions for the entire episode
+            self.max_steps + 64
+        )  # Buffer size to hold actions for the entire episode (margin >= largest chunk returned by the policy)
 
         self.action_dim = len(self.robot.action_features)  # action_features = 7 dims per arm (6 joints + gripper) * 2 arms = 14
 
@@ -121,6 +118,7 @@ class TrossenOpenPIBridge:
             joint_features = list(self.robot.action_features.keys())
             action_dict = {k: full_action[i] for i, k in enumerate(joint_features)}
             self.robot.send_action(action_dict)
+            # Executa de maneira sequêncial as ações até que elas finalizem e faça outra pergunta ao modelo.
         else:
             logger.error(f"Unknown mode: {self.test_mode}. No action executed.")
 
@@ -198,10 +196,12 @@ class TrossenOpenPIBridge:
                 }
 
                 logger.info(f"Step {self.episode_step}: Requesting new action chunk")
+                # Momento da inferência feita ao modelo do pi05
                 response = self.policy_client.infer(observation)
                 self.current_action_chunk = response["actions"]
+                chunk_len = self.current_action_chunk.shape[0]  # actual chunk length returned by the policy
 
-                for k in range(self.action_chunk_size):
+                for k in range(chunk_len):
                     future_t = self.episode_step + k
                     if future_t < self.action_buffer_size:
                         self.action_buffer[future_t].append(self.current_action_chunk[k])
@@ -210,8 +210,9 @@ class TrossenOpenPIBridge:
                 logger.info(f"Received action chunk: {self.current_action_chunk.shape}")
 
             # Select action using temporal ensembling if enabled
+            ## TODO: Estudar mais sobre temporal_ensemble_coefficient
             if self.temporal_ensemble_coefficient is not None:
-                if len(self.action_buffer[self.episode_step]) == 0:
+                if len([self.episode_step]) == 0:
                     a_t = np.zeros(self.action_dim)
                 else:
                     candidates = np.array(self.action_buffer[self.episode_step])  # shape: (N, 14)
