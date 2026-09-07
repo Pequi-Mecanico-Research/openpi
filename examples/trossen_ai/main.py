@@ -150,6 +150,28 @@ class TrossenOpenPIBridge:
             positions = interpolator_position(current_time)
             self.execute_action(positions)
 
+    def blend_pi05_inference(
+        self, previous_keyframe: np.ndarray, next_keyframe: np.ndarray, blend_duration: float = 0.5
+    ):
+        """Smoothly move the arm between the last keyframe actually executed from the outgoing
+        action chunk and the first keyframe of the newly inferred chunk. Avoids the jerk caused by
+        snapping directly between two independently inferred chunks. Uses the same PCHIP
+        interpolation pattern as move_to_start_position, but over a much shorter duration.
+        blend_duration should stay comfortably above the arm driver's own per-call ramp time
+        (min_time_to_move_multiplier / loop_rate, ~0.13s with this bridge's config) since each
+        execute_action call here also gets its own firmware-level ramp to the target."""
+        waypoints = np.array([previous_keyframe, next_keyframe])
+        timepoints = np.array([0, blend_duration])
+        interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+
+        start_time = time.time()
+        end_time = start_time + timepoints[-1]
+
+        while time.time() < end_time:
+            current_time = time.time() - start_time
+            positions = interpolator_position(current_time)
+            self.execute_action(positions)
+
     def run_episode(self, task_prompt: str = "look down"):
         """Run a single episode of policy execution."""
         logger.info(f"Starting episode with prompt: '{task_prompt}'")
@@ -198,6 +220,10 @@ class TrossenOpenPIBridge:
                 logger.info(f"Step {self.episode_step}: Requesting new action chunk")
                 # Momento da inferência feita ao modelo do pi05
                 response = self.policy_client.infer(observation)
+                if self.current_action_chunk is not None:
+                    previous_keyframe = self.current_action_chunk[self.action_chunk_idx - 1]
+                    next_keyframe = response["actions"][0]
+                    self.blend_pi05_inference(previous_keyframe, next_keyframe)
                 self.current_action_chunk = response["actions"]
                 chunk_len = self.current_action_chunk.shape[0]  # actual chunk length returned by the policy
 
