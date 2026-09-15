@@ -699,7 +699,6 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotWidowXDataConfig(
             repo_id="Guilhermefrazao/widowxai-organize-the-table-effort-v21",
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -716,7 +715,6 @@ _CONFIGS = [
             weight_decay=1e-10,
             clip_gradient_norm=1,
         ),
-        ema_decay=None,
         batch_size=16,
         num_workers=4,
         num_train_steps=20_000,
@@ -724,11 +722,6 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=4_000,
         wandb_enabled=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        policy_metadata=None,
-        fsdp_devices=1,
     ),
     #
     # Fine-tuning Libero configs.

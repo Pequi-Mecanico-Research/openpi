@@ -1,3 +1,7 @@
+# Pequi Mecânico
+
+Foram adicionados 3 arquivos .sh para facilitar a execução do repositório *Inferência* - client_inference.sh e server_inference.sh. Para o *Treinamento* - training.sh
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
