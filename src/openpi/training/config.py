@@ -730,6 +730,45 @@ _CONFIGS = [
         policy_metadata=None,
         fsdp_devices=1,
     ),
+    # Fine-tuning FULL (sem LoRA) do pi0.5 no mesmo dataset do config LoRA acima, para 1x H100 80GB.
+    # Ver docs/full_finetune_h100_slurm.md para o racional de cada hiperparametro e o fluxo Slurm/Apptainer.
+    TrainConfig(
+        name="pi05_widowxai_organize_table_full",
+        exp_name="pi05_organize_cube_with_effort_full",
+        # Variantes "gemma_2b" / "gemma_300m" (default) -> todos os pesos treinaveis, sem adaptadores LoRA.
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotWidowXDataConfig(
+            repo_id="Guilhermefrazao/widowxai-organize-the-table-effort-v21",
+            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # LR de pico menor que no LoRA: agora o backbone de 3B inteiro e atualizado.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,  # == num_train_steps
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1,
+        ),
+        # EMA ajuda a estabilizar o fine-tuning completo (default do openpi para full FT).
+        ema_decay=0.99,
+        batch_size=32,
+        num_workers=8,
+        num_train_steps=20_000,
+        log_interval=100,
+        save_interval=1_000,
+        keep_period=5_000,
+        wandb_enabled=True,
+        # Sem freeze_filter: nada congelado.
+        fsdp_devices=1,
+    ),
     #
     # Fine-tuning Libero configs.
     #

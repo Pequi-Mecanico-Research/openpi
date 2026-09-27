@@ -1,7 +1,10 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import signal
+import sys
 from typing import Any
 
 import etils.epath as epath
@@ -47,6 +50,32 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
+# Exit code used when training stops early because Slurm asked it to (SIGUSR1 before the time limit, or SIGTERM on
+# scancel/maintenance). The checkpoint for the last completed step has been saved, so the job can be resumed.
+PREEMPTED_EXIT_CODE = 99
+
+_stop_signal: int | None = None
+
+
+def install_stop_signal_handlers() -> None:
+    """Turns SIGUSR1/SIGTERM into a "save a checkpoint and stop" request instead of killing the process."""
+    main_pid = os.getpid()
+
+    def handler(signum, frame):
+        global _stop_signal
+        if os.getpid() != main_pid:
+            # Forked data loader workers inherit this handler: keep the default behaviour for them.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        if _stop_signal is None:
+            logging.warning(f"Received {signal.Signals(signum).name}: will save a checkpoint and stop.")
+        _stop_signal = signum
+
+    signal.signal(signal.SIGUSR1, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -55,10 +84,12 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+    wandb_id_file = ckpt_dir / "wandb_id.txt"
+    if resuming and wandb_id_file.exists():
+        run_id = wandb_id_file.read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
+        # Also covers resuming a run whose first segment had wandb disabled (no wandb_id.txt yet).
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
@@ -193,6 +224,7 @@ def train_step(
 
 def main(config: _config.TrainConfig):
     init_logging()
+    install_stop_signal_handlers()
     logging.info(f"Running on: {platform.node()}")
 
     if config.batch_size % jax.device_count() != 0:
@@ -200,7 +232,8 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax_cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path(jax_cache_dir).expanduser()))
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -267,6 +300,13 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+
+        if _stop_signal is not None:
+            # Checked before fetching the next batch, since a SIGTERM may also have hit the data loader workers.
+            logging.warning(f"Stopping early at step {step}; saving checkpoint.")
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            break
+
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
@@ -274,6 +314,10 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    if _stop_signal is not None:
+        wandb.finish(exit_code=PREEMPTED_EXIT_CODE)
+        sys.exit(PREEMPTED_EXIT_CODE)
 
 
 if __name__ == "__main__":
