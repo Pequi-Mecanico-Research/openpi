@@ -19,6 +19,7 @@ Usage:
 import argparse
 from collections import defaultdict
 import logging
+import threading
 import time
 
 import cv2
@@ -97,6 +98,31 @@ class TrossenOpenPIBridge:
         self.is_running = False
         self.rate_of_inference = 50 # Number of control steps per policy inference (matches README and Pi-0 paper)
 
+        # Web control panel state: mutable prompt, pause/abort signals, live status, and episode history.
+        self.task_prompt = ""
+        self.pause_requested = threading.Event()
+        self.abort_requested = threading.Event()
+        self.status = {
+            "is_running": False,
+            "is_paused": False,
+            "phase": "idle",
+            "episode_step": 0,
+            "max_steps": self.max_steps,
+            "prompt": "",
+            "hz": 0.0,
+            "loop_ms": 0.0,
+            "mode": self.test_mode,
+        }
+        self.history = []
+        self._episode_counter = 0
+
+        # Safe pose the arm returns to when an episode completes or is aborted.
+        # Matches WidowXAIFollowerConfig's own default `staged_positions`:
+        # [joint_0, joint_1, joint_2, joint_3, joint_4, joint_5, left_carriage_joint (gripper, meters)].
+        self.ready_position: np.ndarray | None = np.array(
+            [0, np.pi / 3, np.pi / 6, np.pi / 5, 0, 0, 0]
+        )
+
         self.temporal_ensemble_coefficient = None  #Testar 0.01 # Temporal ensembling weight (can be set to None for no ensembling)
 
         # FIFO Buffer for actions
@@ -172,102 +198,168 @@ class TrossenOpenPIBridge:
             positions = interpolator_position(current_time)
             self.execute_action(positions)
 
-    def run_episode(self, task_prompt: str = "look down"):
+    def move_to_ready_position(self, duration: float = 3.0):
+        """Smoothly return the arm to a safe 'ready' pose after an episode ends (completed or aborted).
+        No-op with a warning until self.ready_position is configured for this robot."""
+        if self.ready_position is None:
+            logger.warning("ready_position is not configured; skipping move to ready pose.")
+            return
+        logger.info("Moving to ready position...")
+        self.move_to_start_position(self.ready_position, duration=duration)
+
+    def run_episode(self, task_prompt: str = "look down", max_steps: int | None = None):
         """Run a single episode of policy execution."""
-        logger.info(f"Starting episode with prompt: '{task_prompt}'")
+        if max_steps is not None:
+            self.max_steps = max_steps
+            self.action_buffer_size = self.max_steps + 64
+        logger.info(f"Starting episode with prompt: '{task_prompt}' (max_steps={self.max_steps})")
         self.episode_step = 0
         self.action_chunk_idx = 0
         self.current_action_chunk = None
         self.is_running = True
+        self.pause_requested.clear()
+        self.abort_requested.clear()
+        self.task_prompt = task_prompt
         is_first_step = True
 
-        while self.is_running and self.episode_step < self.max_steps:
-            start_loop_time = time.perf_counter()
+        self._episode_counter += 1
+        history_entry = {
+            "id": self._episode_counter,
+            "prompt": task_prompt,
+            "start_time": time.time(),
+            "end_time": None,
+            "steps_completed": 0,
+            "stop_reason": None,
+            "outcome": None,
+        }
+        self.history.append(history_entry)
+        stop_reason = "completed"
 
-            # Request new action chunk after consuming the previous one
-            if self.current_action_chunk is None or self.action_chunk_idx >= self.rate_of_inference:
-                observation_dict = self.robot.get_observation()
+        try:
+            while self.is_running and self.episode_step < self.max_steps:
+                if self.abort_requested.is_set():
+                    stop_reason = "aborted"
+                    break
 
-                # Extract joint positions from observation
-                joint_pos_keys = [k for k in observation_dict.keys() if k.endswith(".pos")]
-                joint_positions = np.array([observation_dict[k] for k in joint_pos_keys])
+                if self.pause_requested.is_set():
+                    self.status["is_paused"] = True
+                    self.status["phase"] = "paused"
+                    time.sleep(self.dt)
+                    continue
+                self.status["is_paused"] = False
+                self.status["phase"] = "running"
 
-                # Transform and resize images from all cameras
-                cameras = list(self.robot._cameras_ft.keys())
-                for cam in cameras:
-                    image_hwc = observation_dict[cam]
-                    # convert BGR to RGB
-                    image_resized = cv2.resize(image_hwc, (224, 224))
-                    image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
-                    image_chw = np.transpose(image_rgb, (2, 0, 1))
-                    observation_dict[cam] = image_chw
+                start_loop_time = time.perf_counter()
 
-                # Create observation for policy to follow the ALOHA format
-                """observation = {
-                    "state": joint_positions,
-                    "images": {cam: observation_dict[cam] for cam in cameras},
-                    "prompt": task_prompt,
-                }"""
-                
-                observation = {
-                    "observation/state": joint_positions,
-                    "observation/image": observation_dict["cam_high"],
-                    "observation/wrist_image": observation_dict["cam_wrist"],
-                    "observation/low_image": observation_dict["cam_low"],
-                    "prompt": task_prompt,
+                # Request new action chunk after consuming the previous one
+                if self.current_action_chunk is None or self.action_chunk_idx >= self.rate_of_inference:
+                    observation_dict = self.robot.get_observation()
+
+                    # Extract joint positions from observation
+                    joint_pos_keys = [k for k in observation_dict.keys() if k.endswith(".pos")]
+                    joint_positions = np.array([observation_dict[k] for k in joint_pos_keys])
+
+                    # Transform and resize images from all cameras
+                    cameras = list(self.robot._cameras_ft.keys())
+                    for cam in cameras:
+                        image_hwc = observation_dict[cam]
+                        # convert BGR to RGB
+                        image_resized = cv2.resize(image_hwc, (224, 224))
+                        image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
+                        image_chw = np.transpose(image_rgb, (2, 0, 1))
+                        observation_dict[cam] = image_chw
+
+                    # Create observation for policy to follow the ALOHA format
+                    """observation = {
+                        "state": joint_positions,
+                        "images": {cam: observation_dict[cam] for cam in cameras},
+                        "prompt": self.task_prompt,
+                    }"""
+
+                    observation = {
+                        "observation/state": joint_positions,
+                        "observation/image": observation_dict["cam_high"],
+                        "observation/wrist_image": observation_dict["cam_wrist"],
+                        "observation/low_image": observation_dict["cam_low"],
+                        "prompt": self.task_prompt,
+                    }
+
+                    logger.info(f"Step {self.episode_step}: Requesting new action chunk")
+                    # Momento da inferência feita ao modelo do pi05
+                    response = self.policy_client.infer(observation)
+                    if self.current_action_chunk is not None:
+                        previous_keyframe = self.current_action_chunk[self.action_chunk_idx - 1]
+                        next_keyframe = response["actions"][0]
+                        self.blend_pi05_inference(previous_keyframe, next_keyframe)
+                    self.current_action_chunk = response["actions"]
+                    chunk_len = self.current_action_chunk.shape[0]  # actual chunk length returned by the policy
+
+                    for k in range(chunk_len):
+                        future_t = self.episode_step + k
+                        if future_t < self.action_buffer_size:
+                            self.action_buffer[future_t].append(self.current_action_chunk[k])
+
+                    self.action_chunk_idx = 0
+                    logger.info(f"Received action chunk: {self.current_action_chunk.shape}")
+
+                # Select action using temporal ensembling if enabled
+                ## TODO: Estudar mais sobre temporal_ensemble_coefficient
+                if self.temporal_ensemble_coefficient is not None:
+                    if len([self.episode_step]) == 0:
+                        a_t = np.zeros(self.action_dim)
+                    else:
+                        candidates = np.array(self.action_buffer[self.episode_step])  # shape: (N, 14)
+                        weights = self._get_weights(len(candidates))  # shape: (N,)
+                        a_t = np.average(candidates, axis=0, weights=weights)  # shape: (14,)
+                else:
+                    a_t = self.current_action_chunk[self.action_chunk_idx]
+                # Execute the current action
+                if is_first_step:
+                    logger.info("Moving to start position to avoid large jumps...")
+                    self.move_to_start_position(a_t, duration=5.0)
+                    is_first_step = False
+                else:
+                    self.execute_action(a_t)
+
+                self.action_chunk_idx += 1
+                self.episode_step += 1
+
+                dt_s = time.perf_counter() - start_loop_time
+                busy_wait_time = self.dt - dt_s
+
+                # Busy wait to maintain control frequency
+                if busy_wait_time > 0:
+                    time.sleep(busy_wait_time)
+                loop_s = time.perf_counter() - start_loop_time
+                logger.info(f"time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+
+                self.status = {
+                    "is_running": True,
+                    "is_paused": False,
+                    "phase": "running",
+                    "episode_step": self.episode_step,
+                    "max_steps": self.max_steps,
+                    "prompt": self.task_prompt,
+                    "hz": (1 / loop_s) if loop_s > 0 else 0.0,
+                    "loop_ms": loop_s * 1e3,
+                    "mode": self.test_mode,
                 }
 
-                logger.info(f"Step {self.episode_step}: Requesting new action chunk")
-                # Momento da inferência feita ao modelo do pi05
-                response = self.policy_client.infer(observation)
-                if self.current_action_chunk is not None:
-                    previous_keyframe = self.current_action_chunk[self.action_chunk_idx - 1]
-                    next_keyframe = response["actions"][0]
-                    self.blend_pi05_inference(previous_keyframe, next_keyframe)
-                self.current_action_chunk = response["actions"]
-                chunk_len = self.current_action_chunk.shape[0]  # actual chunk length returned by the policy
-
-                for k in range(chunk_len):
-                    future_t = self.episode_step + k
-                    if future_t < self.action_buffer_size:
-                        self.action_buffer[future_t].append(self.current_action_chunk[k])
-
-                self.action_chunk_idx = 0
-                logger.info(f"Received action chunk: {self.current_action_chunk.shape}")
-
-            # Select action using temporal ensembling if enabled
-            ## TODO: Estudar mais sobre temporal_ensemble_coefficient
-            if self.temporal_ensemble_coefficient is not None:
-                if len([self.episode_step]) == 0:
-                    a_t = np.zeros(self.action_dim)
-                else:
-                    candidates = np.array(self.action_buffer[self.episode_step])  # shape: (N, 14)
-                    weights = self._get_weights(len(candidates))  # shape: (N,)
-                    a_t = np.average(candidates, axis=0, weights=weights)  # shape: (14,)
-            else:
-                a_t = self.current_action_chunk[self.action_chunk_idx]
-            # Execute the current action
-            if is_first_step:
-                logger.info("Moving to start position to avoid large jumps...")
-                self.move_to_start_position(a_t, duration=5.0)
-                is_first_step = False
-            else:
-                self.execute_action(a_t)
-
-            self.action_chunk_idx += 1
-            self.episode_step += 1
-
-            dt_s = time.perf_counter() - start_loop_time
-            busy_wait_time = self.dt - dt_s
-
-            # Busy wait to maintain control frequency
-            if busy_wait_time > 0:
-                time.sleep(busy_wait_time)
-            loop_s = time.perf_counter() - start_loop_time
-            logger.info(f"time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
-
-        self.is_running = False
-        logger.info(f"Episode completed after {self.episode_step} steps")
+            if stop_reason in ("completed", "aborted"):
+                self.status["phase"] = "returning_to_ready"
+                self.move_to_ready_position()
+        except Exception:
+            logger.exception("Episode aborted due to an error")
+            stop_reason = "error"
+        finally:
+            self.is_running = False
+            history_entry["end_time"] = time.time()
+            history_entry["steps_completed"] = self.episode_step
+            history_entry["stop_reason"] = stop_reason
+            self.status["is_running"] = False
+            self.status["is_paused"] = False
+            self.status["phase"] = "idle"
+            logger.info(f"Episode completed after {self.episode_step} steps (reason: {stop_reason})")
 
     def _get_weights(self, num_preds: int) -> np.ndarray:
         weights = np.exp(-self.temporal_ensemble_coefficient * np.arange(num_preds))

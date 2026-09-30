@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trossen AI — Painel de Controle VLA</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Painel de Controle — VLA</h1>
+    <div id="badges">
+      <span id="mode-badge" class="badge">modo: --</span>
+      <span id="running-badge" class="badge badge-idle">parado</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="cameras" aria-label="Câmeras do manipulador"></section>
+
+    <section id="controls">
+      <div class="control-row">
+        <label for="prompt-input">Prompt da tarefa</label>
+        <input id="prompt-input" type="text" placeholder="ex: pegue o cubo vermelho" />
+        <label for="max-steps-input" class="inline-label">Passos máximos</label>
+        <input id="max-steps-input" type="number" min="1" step="1" placeholder="padrão do servidor" />
+        <button id="start-btn">Iniciar</button>
+        <button id="pause-btn" class="danger">Parar</button>
+        <button id="resume-btn" class="ok" hidden>Retomar</button>
+        <button id="abort-btn" class="danger" hidden>Abortar</button>
+      </div>
+      <p class="safety-note">
+        "Parar" pausa o loop de controle por software (~1 ciclo) e segura o braço na última posição comandada.
+        Não é um e-stop físico — mantenha um operador com acesso à parada de emergência do braço durante
+        qualquer demonstração ao vivo.
+      </p>
+    </section>
+
+    <section id="telemetry">
+      <h2>Telemetria</h2>
+      <div class="telemetry-grid">
+        <div><span class="label">Step</span><span id="tel-step">--</span></div>
+        <div><span class="label">Frequência</span><span id="tel-hz">--</span></div>
+        <div><span class="label">Latência do loop</span><span id="tel-loop">--</span></div>
+        <div><span class="label">Prompt ativo</span><span id="tel-prompt">--</span></div>
+      </div>
+    </section>
+
+    <section id="history">
+      <h2>Histórico de execuções</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Prompt</th>
+            <th>Início</th>
+            <th>Passos</th>
+            <th>Motivo da parada</th>
+            <th>Resultado</th>
+          </tr>
+        </thead>
+        <tbody id="history-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
