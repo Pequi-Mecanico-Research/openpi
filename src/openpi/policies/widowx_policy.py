@@ -66,6 +66,46 @@ class WidowXInputs(transforms.DataTransformFn):
             inputs["prompt"] = data["prompt"]
 
         return inputs
+    
+    
+@dataclasses.dataclass(frozen=True)
+class WidowXBaseInputs(transforms.DataTransformFn):
+    """
+    Converte as entradas do dataset/robô WidowX AI com base móvel (2 câmeras: cam_main, cam_wrist)
+    para o formato interno esperado pelo modelo pi0/pi0.5. Usado no treino e na inferência.
+    As ações já incluem a velocidade linear (cmd_vel) e angular (ang_vel) da base nas dims 7 e 8.
+    """
+
+    # Determina qual variante do modelo será usada.
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image"])        # cam_main -> visão base
+        wrist_image = _parse_image(data["observation/wrist_image"])  # cam_wrist -> pulso único
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Só mascaramos imagens de padding no pi0/pi0.5, não no pi0-FAST.
+                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            },
+        }
+
+        # Ações só existem durante o treino.
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +116,17 @@ class WidowXOutputs(transforms.DataTransformFn):
     """
 
     def __call__(self, data: dict) -> dict:
-        # retorno de apenas 7 juntas (6 juntas + 1 garra) para o robô WidowX AI.
         print("WidowXOutputs: returning only first 7 dims of actions")
         return {"actions": np.asarray(data["actions"][:, :7])}
+
+
+
+@dataclasses.dataclass(frozen=True)
+class WidowXBaseOutputs(transforms.DataTransformFn):
+    """
+    Converte a saída do modelo de volta ao formato do WidowX AI com base móvel.
+    Usado apenas na inferência.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, :9])}

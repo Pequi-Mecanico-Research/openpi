@@ -393,6 +393,45 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
             action_sequence_keys=("action",),
         )
  
+ 
+@dataclasses.dataclass(frozen=True)
+class LeRobotWidowXWithMovelBaseDataConfig(DataConfigFactory):
+    """
+    Config de dados para o dataset WidowX AI com base móvel (2 câmeras: cam_high, cam_wrist;
+    9 DOF: 6 juntas + garra + cmd_vel + ang_vel).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.cam_high",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+ 
+        data_transforms = _transforms.Group(
+            inputs=[widowx_policy.WidowXBaseInputs(model_type=model_config.model_type)],
+            outputs=[widowx_policy.WidowXBaseOutputs()],
+        )
+ 
+        model_transforms = ModelTransformFactory()(model_config)
+ 
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+ 
 
 
 @dataclasses.dataclass(frozen=True)
@@ -726,7 +765,7 @@ _CONFIGS = [
     # Fine-tuning FULL (sem LoRA) do pi0.5 no mesmo dataset do config LoRA acima, para 1x H100 80GB.
     # Ver docs/full_finetune_h100_slurm.md para o racional de cada hiperparametro e o fluxo Slurm/Apptainer.
     TrainConfig(
-        name="pi05_widowxai_organize_table_full",
+        name="pi05_widowxai_organize_table_full_finetuning",
         exp_name="pi05_organize_cube_with_effort_full",
         # Variantes "gemma_2b" / "gemma_300m" (default) -> todos os pesos treinaveis, sem adaptadores LoRA.
         model=pi0_config.Pi0Config(pi05=True),
@@ -762,6 +801,36 @@ _CONFIGS = [
         # Sem freeze_filter: nada congelado.
         fsdp_devices=1,
     ),
+    TrainConfig(
+            name="pi05_widowxai_with_base",
+            exp_name="pi05_move_cube_from_table",
+            model=pi0_config.Pi0Config(pi05=True), #, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="Guilhermefrazao/widowxai-organize-the-table-effort-v21",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=16,
+            num_workers=4,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=4_000,
+            wandb_enabled=True,
+        ),
     #
     # Fine-tuning Libero configs.
     #
