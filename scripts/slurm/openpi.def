@@ -1,0 +1,53 @@
+Bootstrap: docker
+From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+# Imagem Apptainer para treinar o openpi (JAX) no cluster DGX.
+# Espelha scripts/docker/serve_policy.Dockerfile, com duas diferencas:
+#   - instala ffmpeg: o LeRobot pinado usa torchcodec, que precisa das libs do FFmpeg para decodificar os videos AV1;
+#   - o interpretador gerenciado pelo uv fica em /opt (no Docker ficaria em /root, ilegivel para o usuario do Slurm).
+#
+# Build (a partir da raiz do repo, ver scripts/slurm/build_container.sbatch):
+#   apptainer build --fakeroot /raid/$USER/containers/openpi.sif scripts/slurm/openpi.def
+#
+# Apenas as dependencias vao para a imagem. O codigo (src/, scripts/) e montado em /app na hora de rodar,
+# entao mudar config.py ou train.py NAO exige rebuild; mudar pyproject.toml/uv.lock exige.
+
+%files
+    pyproject.toml /app/pyproject.toml
+    uv.lock /app/uv.lock
+    packages/openpi-client /app/packages/openpi-client
+
+%environment
+    export VIRTUAL_ENV=/opt/venv
+    export PATH=/opt/venv/bin:$PATH
+    export PYTHONPATH=/app/src
+    export PYTHONUNBUFFERED=1
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git git-lfs build-essential clang ffmpeg libgl1 libglib2.0-0
+    rm -rf /var/lib/apt/lists/*
+
+    curl -LsSf https://astral.sh/uv/0.5.1/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+    export UV_PROJECT_ENVIRONMENT=/opt/venv
+    export UV_CACHE_DIR=/tmp/uv-cache
+    export UV_LINK_MODE=copy
+    cd /app
+    uv venv --python 3.11.9 /opt/venv
+    GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+    rm -rf /tmp/uv-cache
+    chmod -R a+rX /opt
+
+    # Sanidade: o decoder AV1 precisa existir no ffmpeg da imagem.
+    ffmpeg -hide_banner -decoders | grep -Ei "av1|dav1d"
+
+%test
+    /opt/venv/bin/python -c "import jax, torchcodec, lerobot; print('jax', jax.__version__)"
+
+%labels
+    Description openpi (pi0/pi0.5) training image for Slurm + Apptainer
