@@ -190,9 +190,9 @@ def main():
     parser.add_argument("--control_freq", type=int, default=30, help="Control frequency in Hz")
     parser.add_argument(
         "--mode",
-        choices=["autonomous", "test"],
+        choices=["autonomous", "autonomous_base", "test"],
         default="autonomous",
-        help="Operation mode: autonomous (execute) or test (no movement)",
+        help="Operation mode: autonomous (arm only), autonomous_base (arm + mobile base) or test (no movement)",
     )
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
     parser.add_argument("--web_host", default="0.0.0.0", help="Host to serve the web panel on")

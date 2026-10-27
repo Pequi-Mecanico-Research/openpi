@@ -1,0 +1,22 @@
+# Cliente WidowX AI + base móvel (ROS 2 Jazzy).
+# Inferência: ./client_inference_base.sh na raiz. Shell: docker compose run --rm --build trossen_openpi_base
+services:
+  trossen_openpi_base:
+    image: trossen_openpi_base
+    build:
+      context: .
+      additional_contexts:
+        openpi_client: ../../packages/openpi-client
+    # Rede do host: braço (192.168.1.2), servidor de policy e descoberta DDS do ROS 2 com a base.
+    network_mode: host
+    # Memória compartilhada do DDS com nós ROS 2 rodando no host.
+    ipc: host
+    # Acesso às câmeras RealSense (USB).
+    privileged: true
+    volumes:
+      - /dev:/dev
+    environment:
+      # Deve ser o mesmo ROS_DOMAIN_ID usado pela base.
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    stdin_open: true
+    tty: true

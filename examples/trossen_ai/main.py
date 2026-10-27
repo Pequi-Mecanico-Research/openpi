@@ -12,6 +12,9 @@ Handles:
 Usage:
     python main.py --mode autonomous --task_prompt "grab and handover red cube"
 
+    Arm + mobile base (publishes cmd_vel/ang_vel on ROS 2, see Dockerfile):
+    python main.py --mode autonomous_base --base_topic /cmd_vel --task_prompt "move the cube from the table"
+
     Test mode (no movement):
     python main.py --mode test --task_prompt "grab and handover red cube"
 """
@@ -19,6 +22,8 @@ Usage:
 import argparse
 from collections import defaultdict
 import logging
+import signal
+import sys
 import threading
 import time
 
@@ -31,8 +36,13 @@ import numpy as np
 from openpi_client import websocket_client_policy
 from scipy.interpolate import PchipInterpolator
 
+from ros2_base_bridge import BaseVelocityBridge
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Dimensões da base móvel no fim do vetor de ação: [cmd_vel (linear), ang_vel (angular)].
+BASE_ACTION_DIM = 2
 
 
 class TrossenOpenPIBridge:
@@ -43,8 +53,9 @@ class TrossenOpenPIBridge:
         policy_server_host: str = "localhost",
         policy_server_port: int = 8000,
         control_frequency: int = 30,
-        test_mode: str = "autonomous",  # "autonomous" or "test"
+        test_mode: str = "autonomous",  # "autonomous" (arm), "autonomous_base" (arm + base) or "test"
         max_steps: int = 1000,
+        base_topic: str = "/cmd_vel",
     ):
         self.control_frequency = control_frequency
         self.max_steps = max_steps
@@ -89,6 +100,11 @@ class TrossenOpenPIBridge:
             },
         )"""
         
+        # A base só é conectada no modo autonomous_base; no modo teste os comandos são apenas impressos
+        # e no modo autonomous as dims da base são ignoradas.
+        # Iniciada antes do braço para falhar cedo caso o ROS 2 não esteja disponível.
+        self.base = BaseVelocityBridge(topic=base_topic) if test_mode == "autonomous_base" else None
+
         self.robot = make_robot_from_config(robot_config)
         self.robot.connect()
 
@@ -131,22 +147,35 @@ class TrossenOpenPIBridge:
             self.max_steps + 64
         )  # Buffer size to hold actions for the entire episode (margin >= largest chunk returned by the policy)
 
-        self.action_dim = len(self.robot.action_features)  # action_features = 7 dims per arm (6 joints + gripper) * 2 arms = 14
+        self.arm_action_dim = len(self.robot.action_features)  # 7 dims (6 joints + gripper)
+        self.action_dim = self.arm_action_dim + BASE_ACTION_DIM  # + cmd_vel e ang_vel da base
 
     def execute_action(self, action: np.ndarray):
-        """Execute action on the arm."""
+        """Execute action on the arm and, if the action includes it, on the mobile base."""
         full_action = action.copy()
+        arm_action = full_action[: self.arm_action_dim]
+        base_action = full_action[self.arm_action_dim : self.arm_action_dim + BASE_ACTION_DIM] if self.base is not None else np.zeros(BASE_ACTION_DIM)
 
         if self.test_mode == "test":
-            logger.info(f"TEST MODE: Would execute action: {full_action}")
+            logger.info(f"TEST MODE: Would execute arm action: {arm_action}")
+            if base_action.size == BASE_ACTION_DIM:
+                logger.info(f"TEST MODE: Would publish base cmd_vel={base_action[0]:.4f} ang_vel={base_action[1]:.4f}")
             return
-        if self.test_mode == "autonomous":
+        if self.test_mode in ("autonomous", "autonomous_base"):
             joint_features = list(self.robot.action_features.keys())
-            action_dict = {k: full_action[i] for i, k in enumerate(joint_features)}
+            action_dict = {k: arm_action[i] for i, k in enumerate(joint_features)}
             self.robot.send_action(action_dict)
+
+            if self.base is not None and base_action.size == BASE_ACTION_DIM:
+                self.base.send(base_action[0], base_action[1])
             # Executa de maneira sequêncial as ações até que elas finalizem e faça outra pergunta ao modelo.
         else:
             logger.error(f"Unknown mode: {self.test_mode}. No action executed.")
+
+    def stop_base(self):
+        """Send zero velocity to the mobile base (no-op in test mode)."""
+        if self.base is not None:
+            self.base.stop()
 
     def move_to_start_position(self, goal_position: np.ndarray, duration: float = 5.0):
         """The first position queried from the policy depends on the training data.
@@ -163,7 +192,9 @@ class TrossenOpenPIBridge:
         #  right_joint_0, right_joint_1, right_joint_2, right_joint_3, right_joint_4, right_joint_5, right_left_carriage_joint]
         # The values below represent a "stage" pose, e.g. arms up and open, ready for task start.
         # stage_pose = np.array([0, np.pi/3, np.pi/6, np.pi/5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        waypoints = np.array([current_pose, goal_position])
+        # Movimento só do braço: a base fica parada e as dims de velocidade da ação são ignoradas.
+        self.stop_base()
+        waypoints = np.array([current_pose, goal_position[: self.arm_action_dim]])
         timepoints = np.array([0, duration])  # Use the provided duration
         interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
 
@@ -242,6 +273,7 @@ class TrossenOpenPIBridge:
                     break
 
                 if self.pause_requested.is_set():
+                    self.stop_base()
                     self.status["is_paused"] = True
                     self.status["phase"] = "paused"
                     time.sleep(self.dt)
@@ -352,6 +384,7 @@ class TrossenOpenPIBridge:
             logger.exception("Episode aborted due to an error")
             stop_reason = "error"
         finally:
+            self.stop_base()
             self.is_running = False
             history_entry["end_time"] = time.time()
             history_entry["steps_completed"] = self.episode_step
@@ -373,6 +406,8 @@ class TrossenOpenPIBridge:
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
+        if self.base is not None:
+            self.base.close()
         self.robot.disconnect()
 
 
@@ -383,12 +418,13 @@ if __name__ == "__main__":
     parser.add_argument("--control_freq", type=int, default=30, help="Control frequency in Hz")
     parser.add_argument(
         "--mode",
-        choices=["autonomous", "test"],
+        choices=["autonomous", "autonomous_base", "test"],
         default="autonomous",
-        help="Operation mode: autonomous (execute) or test (no movement)",
+        help="Operation mode: autonomous (arm only), autonomous_base (arm + mobile base) or test (no movement)",
     )
     parser.add_argument("--task_prompt", default="move the arm to the left", help="Task description for the policy")
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
+    parser.add_argument("--base_topic", default="/cmd_vel", help="ROS 2 geometry_msgs/Twist topic of the mobile base")
     args = parser.parse_args()
 
     bridge = TrossenOpenPIBridge(
@@ -397,7 +433,10 @@ if __name__ == "__main__":
         control_frequency=args.control_freq,
         test_mode=args.mode,
         max_steps=args.max_steps,
+        base_topic=args.base_topic,
     )
+    
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0)) if args.mode == "autonomous_base" else None
 
     try:
         bridge.autonomous_mode(task_prompt=args.task_prompt)
