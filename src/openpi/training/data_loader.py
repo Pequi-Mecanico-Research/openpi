@@ -1,3 +1,8 @@
+import datasets.features.features as _hf_features
+
+# Parquet files saved with datasets>=4.0.0 use _type="List", while datasets<4.0.0 only registers "Sequence".
+_hf_features._FEATURE_TYPES.setdefault("List", _hf_features.Sequence)
+
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
