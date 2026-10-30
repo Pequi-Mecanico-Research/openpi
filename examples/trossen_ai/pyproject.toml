@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [tool.uv]
-override-dependencies= ["rerun-sdk"]
+# pyrealsense2 só tem wheels x86_64 no PyPI; no aarch64 ele é compilado do código-fonte no Dockerfile.
+override-dependencies= ["rerun-sdk", "pyrealsense2; platform_machine == 'x86_64'"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

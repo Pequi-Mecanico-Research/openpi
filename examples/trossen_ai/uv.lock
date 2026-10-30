@@ -17,7 +17,10 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "rerun-sdk" }]
+overrides = [
+    { name = "pyrealsense2", marker = "platform_machine == 'x86_64'" },
+    { name = "rerun-sdk" },
+]
 
 [[package]]
 name = "absl-py"
@@ -1014,7 +1017,7 @@ wheels = [
 
 [package.optional-dependencies]
 intelrealsense = [
-    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
+    { name = "pyrealsense2", marker = "platform_machine == 'x86_64'" },
     { name = "pyrealsense2-macosx", marker = "sys_platform == 'darwin'" },
 ]
 
