@@ -5,7 +5,7 @@
 # Overrides:   sbatch --export=ALL,EXP_NAME=bs32_v2,AUTO_REQUEUE=1,WANDB_ENTITY=<time> scripts/slurm/train_full.sbatch
 #
 #SBATCH --job-name=pi05-widowx-full
-#SBATCH --partition=h100n3
+#SBATCH --partition=h100n2
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
@@ -15,7 +15,7 @@
 #SBATCH --signal=B:SIGUSR1@300
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=/raid/%u/vla/logs/%x_%j.log
+#SBATCH --output=/raid/%u/teleop/vla/logs/%x_%j.log
 
 set -uo pipefail
 source "${REPO_DIR:-$SLURM_SUBMIT_DIR}/scripts/slurm/env.sh"
@@ -24,6 +24,13 @@ EXP_NAME=${EXP_NAME:-full_h100_bs32}
 # 1 = ao ser interrompido por sinal (com checkpoint salvo), recoloca o job na fila automaticamente.
 AUTO_REQUEUE=${AUTO_REQUEUE:-0}
 PREEMPTED_EXIT_CODE=99  # igual a scripts/train.py
+
+# Sem cgroup de GPU no cluster: sem CUDA_VISIBLE_DEVICES o treino usaria todas as GPUs do no.
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "ERRO: CUDA_VISIBLE_DEVICES vazio; o Slurm nao alocou GPU (confira --gres=gpu:N)." >&2
+    exit 1
+fi
+echo "GPUs alocadas pelo Slurm: $CUDA_VISIBLE_DEVICES"
 
 if ! find "$REPO_DIR/assets/$CONFIG_NAME" -name norm_stats.json 2>/dev/null | grep -q .; then
     echo "ERRO: norm stats ausentes em $REPO_DIR/assets/$CONFIG_NAME. Rode scripts/slurm/norm_stats.sbatch antes." >&2

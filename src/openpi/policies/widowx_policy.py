@@ -42,10 +42,25 @@ class WidowXInputs(transforms.DataTransformFn):
         # O pi0 suporta 3 slots de imagem: uma visão "base" e duas "wrist".
         base_image = _parse_image(data["observation/image"])        # cam_main -> visão base
         wrist_image = _parse_image(data["observation/wrist_image"])  # cam_wrist -> pulso único
-        low_image = _parse_image(data["observation/low_image"])      # cam_low 
+        # Datasets com 2 câmeras (sem cam_low): slot preenchido com zeros e mascarado (mesma convenção do Libero).
+        if "observation/low_image" in data:
+            low_image = _parse_image(data["observation/low_image"])  # cam_low
+            low_mask = np.True_
+        else:
+            low_image = np.zeros_like(base_image)
+            low_mask = np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
+
+        # Datasets com esforço em coluna separada: concatena ao state (7 pos + 7 esforço = 14),
+        # mesmo layout do dataset antigo, que ja trazia os 14 valores em observation.state.
+        state = np.asarray(data["observation/state"], dtype=np.float32)
+        if "observation/effort" in data:
+            state = np.concatenate([state, np.asarray(data["observation/effort"], dtype=np.float32)], axis=-1)
+        # Base móvel: odometria (x, y, orientation.z, orientation.w, twist.linear.x, twist.angular.z) no fim do state.
+        if "observation/base_odom" in data:
+            state = np.concatenate([state, np.asarray(data["observation/base_odom"], dtype=np.float32)], axis=-1)
 
         inputs = {
-            "state": data["observation/state"],
+            "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
@@ -54,13 +69,13 @@ class WidowXInputs(transforms.DataTransformFn):
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": low_mask,
             },
         }
 
         # Ações só existem durante o treino.
         if "actions" in data:
-            inputs["actions"] = data["actions"]
+            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -75,7 +90,9 @@ class WidowXOutputs(transforms.DataTransformFn):
     Usado apenas na inferência.
     """
 
+    # 7 = 6 juntas + 1 garra. Datasets com base móvel usam 9 (+ cmd_vel.linear.x, cmd_vel.angular.z).
+    action_dim: int = 7
+
     def __call__(self, data: dict) -> dict:
-        # retorno de apenas 7 juntas (6 juntas + 1 garra) para o robô WidowX AI.
-        print("WidowXOutputs: returning only first 7 dims of actions")
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        print(f"WidowXOutputs: returning only first {self.action_dim} dims of actions")
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

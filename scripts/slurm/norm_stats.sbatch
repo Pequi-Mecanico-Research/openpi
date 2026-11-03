@@ -3,11 +3,11 @@
 # Tambem baixa o dataset do HF para o cache no /raid e valida o decode dos videos AV1 antes de alocar GPU no treino.
 # Submeter da RAIZ do repo:   sbatch scripts/slurm/norm_stats.sbatch
 #SBATCH --job-name=openpi-norm-stats
-#SBATCH --partition=h100n3
+#SBATCH --partition=h100n2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
-#SBATCH --output=/raid/%u/vla/logs/%x_%j.log
+#SBATCH --output=/raid/%u/teleop/vla/logs/%x_%j.log
 
 set -euo pipefail
 source "${REPO_DIR:-$SLURM_SUBMIT_DIR}/scripts/slurm/env.sh"

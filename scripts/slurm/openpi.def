@@ -1,8 +1,11 @@
 Bootstrap: docker
-From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+From: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 # Imagem Apptainer para treinar o openpi (JAX) no cluster DGX.
-# Espelha scripts/docker/serve_policy.Dockerfile, com duas diferencas:
+# Espelha scripts/docker/serve_policy.Dockerfile, com tres diferencas:
+#   - base Ubuntu 24.04 (o Dockerfile usa 22.04): sem entrada no /etc/subuid, o --fakeroot injeta o libfakeroot do
+#     host (Ubuntu 24.04, glibc 2.39) no %post, e ele nao carrega na glibc 2.35 do 22.04. O CUDA/cuDNN usado pelo
+#     JAX vem dos wheels nvidia-* do uv.lock, entao a versao do CUDA da base pouco importa;
 #   - instala ffmpeg: o LeRobot pinado usa torchcodec, que precisa das libs do FFmpeg para decodificar os videos AV1;
 #   - o interpretador gerenciado pelo uv fica em /opt (no Docker ficaria em /root, ilegivel para o usuario do Slurm).
 #

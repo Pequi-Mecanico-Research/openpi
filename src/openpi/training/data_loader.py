@@ -5,6 +5,7 @@ import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+import datasets.features.features as _hf_features
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -15,6 +16,11 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+
+# Datasets saved with `datasets>=4` store fixed-size vectors as `List` in the parquet schema metadata, a type that the
+# `datasets==3.6` pinned by lerobot does not know. `List(feature, length)` has the same Arrow layout as
+# `Sequence(feature, length)` in 3.x, so reading it as `Sequence` is lossless.
+_hf_features._FEATURE_TYPES.setdefault("List", _hf_features.Sequence)
 
 T_co = TypeVar("T_co", covariant=True)
 
