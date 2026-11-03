@@ -42,25 +42,10 @@ class WidowXInputs(transforms.DataTransformFn):
         # O pi0 suporta 3 slots de imagem: uma visão "base" e duas "wrist".
         base_image = _parse_image(data["observation/image"])        # cam_main -> visão base
         wrist_image = _parse_image(data["observation/wrist_image"])  # cam_wrist -> pulso único
-        # Datasets com 2 câmeras (sem cam_low): slot preenchido com zeros e mascarado (mesma convenção do Libero).
-        if "observation/low_image" in data:
-            low_image = _parse_image(data["observation/low_image"])  # cam_low
-            low_mask = np.True_
-        else:
-            low_image = np.zeros_like(base_image)
-            low_mask = np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
-
-        # Datasets com esforço em coluna separada: concatena ao state (7 pos + 7 esforço = 14),
-        # mesmo layout do dataset antigo, que ja trazia os 14 valores em observation.state.
-        state = np.asarray(data["observation/state"], dtype=np.float32)
-        if "observation/effort" in data:
-            state = np.concatenate([state, np.asarray(data["observation/effort"], dtype=np.float32)], axis=-1)
-        # Base móvel: odometria (x, y, orientation.z, orientation.w, twist.linear.x, twist.angular.z) no fim do state.
-        if "observation/base_odom" in data:
-            state = np.concatenate([state, np.asarray(data["observation/base_odom"], dtype=np.float32)], axis=-1)
+        low_image = _parse_image(data["observation/low_image"])      # cam_low 
 
         inputs = {
-            "state": state,
+            "state": data["observation/state"],
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
@@ -69,13 +54,53 @@ class WidowXInputs(transforms.DataTransformFn):
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": low_mask,
+                "right_wrist_0_rgb": np.True_,
             },
         }
 
         # Ações só existem durante o treino.
         if "actions" in data:
-            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+    
+    
+@dataclasses.dataclass(frozen=True)
+class WidowXBaseInputs(transforms.DataTransformFn):
+    """
+    Converte as entradas do dataset/robô WidowX AI com base móvel (2 câmeras: cam_main, cam_wrist)
+    para o formato interno esperado pelo modelo pi0/pi0.5. Usado no treino e na inferência.
+    As ações já incluem a velocidade linear (cmd_vel) e angular (ang_vel) da base nas dims 7 e 8.
+    """
+
+    # Determina qual variante do modelo será usada.
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image"])        # cam_main -> visão base
+        wrist_image = _parse_image(data["observation/wrist_image"])  # cam_wrist -> pulso único
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Só mascaramos imagens de padding no pi0/pi0.5, não no pi0-FAST.
+                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            },
+        }
+
+        # Ações só existem durante o treino.
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -90,9 +115,18 @@ class WidowXOutputs(transforms.DataTransformFn):
     Usado apenas na inferência.
     """
 
-    # 7 = 6 juntas + 1 garra. Datasets com base móvel usam 9 (+ cmd_vel.linear.x, cmd_vel.angular.z).
-    action_dim: int = 7
+    def __call__(self, data: dict) -> dict:
+        print("WidowXOutputs: returning only first 7 dims of actions")
+        return {"actions": np.asarray(data["actions"][:, :7])}
+
+
+
+@dataclasses.dataclass(frozen=True)
+class WidowXBaseOutputs(transforms.DataTransformFn):
+    """
+    Converte a saída do modelo de volta ao formato do WidowX AI com base móvel.
+    Usado apenas na inferência.
+    """
 
     def __call__(self, data: dict) -> dict:
-        print(f"WidowXOutputs: returning only first {self.action_dim} dims of actions")
-        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
+        return {"actions": np.asarray(data["actions"][:, :9])}

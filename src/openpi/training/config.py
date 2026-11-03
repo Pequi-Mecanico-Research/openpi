@@ -367,9 +367,9 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "observation.images.cam_high",
-                        "observation/wrist_image": "observation.images.cam_wrist",
-                        "observation/low_image": "observation.images.cam_low",
+                        "observation/image": "observation.images.env",
+                        "observation/wrist_image": "observation.images.wrist",
+                        # "observation/low_image": "observation.images.cam_low",
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
@@ -379,7 +379,7 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
         )
  
         data_transforms = _transforms.Group(
-            inputs=[widowx_policy.WidowXInputs(model_type=model_config.model_type)],
+            inputs=[widowx_policy.WidowXBaseInputs(model_type=model_config.model_type)],
             outputs=[widowx_policy.WidowXOutputs()],
         )
  
@@ -392,42 +392,38 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
         )
-
-
+ 
+ 
 @dataclasses.dataclass(frozen=True)
-class LeRobotWidowX2CamDataConfig(DataConfigFactory):
+class LeRobotWidowXWithMovelBaseDataConfig(DataConfigFactory):
     """
-    Config de dados para datasets WidowX AI com 2 câmeras (env, wrist) e esforço em coluna separada
-    (observation.effort), ex.: jv-costa/widowai-organize-the-table-keep-alive-v21.
-    O WidowXInputs zera/mascara o slot da terceira câmera e concatena o esforço ao state (14 dims).
+    Config de dados para o dataset WidowX AI com base móvel (2 câmeras: cam_high, cam_wrist;
+    9 DOF: 6 juntas + garra + cmd_vel + ang_vel).
     """
-
-    # Dims de ação devolvidas na inferência: 7 (braço + garra) ou 9 (+ cmd_vel da base móvel).
-    action_dim: int = 7
-    # True -> concatena observation.base_odom (6) ao state: 7 pos + 7 esforço + 6 odom = 20 dims.
-    use_base_odom: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_structure = {
-            "observation/image": "observation.images.env",
-            "observation/wrist_image": "observation.images.wrist",
-            "observation/state": "observation.state",
-            "observation/effort": "observation.effort",
-            "actions": "action",
-            "prompt": "prompt",
-        }
-        if self.use_base_odom:
-            repack_structure["observation/base_odom"] = "observation.base_odom"
-        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
-
-        data_transforms = _transforms.Group(
-            inputs=[widowx_policy.WidowXInputs(model_type=model_config.model_type)],
-            outputs=[widowx_policy.WidowXOutputs(action_dim=self.action_dim)],
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.env",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
         )
-
+ 
+        data_transforms = _transforms.Group(
+            inputs=[widowx_policy.WidowXBaseInputs(model_type=model_config.model_type)],
+            outputs=[widowx_policy.WidowXBaseOutputs()],
+        )
+ 
         model_transforms = ModelTransformFactory()(model_config)
-
+ 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -435,6 +431,7 @@ class LeRobotWidowX2CamDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
         )
+ 
 
 
 @dataclasses.dataclass(frozen=True)
@@ -741,7 +738,6 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotWidowXDataConfig(
             repo_id="Guilhermefrazao/widowxai-organize-the-table-effort-v21",
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -758,7 +754,6 @@ _CONFIGS = [
             weight_decay=1e-10,
             clip_gradient_norm=1,
         ),
-        ema_decay=None,
         batch_size=16,
         num_workers=4,
         num_train_steps=20_000,
@@ -766,16 +761,11 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=4_000,
         wandb_enabled=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        policy_metadata=None,
-        fsdp_devices=1,
     ),
     # Fine-tuning FULL (sem LoRA) do pi0.5 no mesmo dataset do config LoRA acima, para 1x H100 80GB.
     # Ver docs/full_finetune_h100_slurm.md para o racional de cada hiperparametro e o fluxo Slurm/Apptainer.
     TrainConfig(
-        name="pi05_widowxai_organize_table_full",
+        name="pi05_widowxai_organize_table_full_finetuning",
         exp_name="pi05_organize_cube_with_effort_full",
         # Variantes "gemma_2b" / "gemma_300m" (default) -> todos os pesos treinaveis, sem adaptadores LoRA.
         model=pi0_config.Pi0Config(pi05=True),
@@ -811,154 +801,36 @@ _CONFIGS = [
         # Sem freeze_filter: nada congelado.
         fsdp_devices=1,
     ),
-    # Mesmo fine-tuning FULL acima, no dataset keep-alive (2 câmeras: env + wrist; esforço em observation.effort).
     TrainConfig(
-        name="pi05_widowxai_organize_table_keep_alive_full",
-        exp_name="pi05_organize_table_keep_alive_full",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotWidowX2CamDataConfig(
-            repo_id="jv-costa/widowai-organize-the-table-keep-alive-v21",
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
-            base_config=DataConfig(prompt_from_task=True),
+            name="pi05_widowxai_with_base",
+            exp_name="pi05_move_cube_from_table",
+            model=pi0_config.Pi0Config(pi05=True), #, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="Guilhermefrazao/wxai_organize_table_inf_base",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=16,
+            num_workers=4,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=4_000,
+            wandb_enabled=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=20_000,  # == num_train_steps
-            decay_lr=2.5e-6,
-        ),
-        optimizer=_optimizer.AdamW(
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=1e-10,
-            clip_gradient_norm=1,
-        ),
-        ema_decay=0.99,
-        batch_size=32,
-        num_workers=8,
-        num_train_steps=20_000,
-        log_interval=100,
-        save_interval=1_000,
-        keep_period=5_000,
-        wandb_enabled=True,
-        fsdp_devices=1,
-    ),
-    # Mesmo fine-tuning FULL, no dataset com base móvel (2 câmeras: env + wrist; esforço em observation.effort).
-    # Ação com 9 dims: 6 juntas + garra + cmd_vel.linear.x + cmd_vel.angular.z (a base se move em ~50% dos frames).
-    TrainConfig(
-        name="pi05_widowxai_organize_table_inf_base_full",
-        exp_name="pi05_organize_table_inf_base_full",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotWidowX2CamDataConfig(
-            repo_id="Guilhermefrazao/wxai_organize_table_inf_base",
-            action_dim=9,
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=20_000,  # == num_train_steps
-            decay_lr=2.5e-6,
-        ),
-        optimizer=_optimizer.AdamW(
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=1e-10,
-            clip_gradient_norm=1,
-        ),
-        ema_decay=0.99,
-        batch_size=32,
-        num_workers=8,
-        num_train_steps=20_000,
-        log_interval=100,
-        save_interval=1_000,
-        keep_period=5_000,
-        wandb_enabled=True,
-        fsdp_devices=1,
-    ),
-    # Base móvel (rafaeljose/base-inf_v21), agora com a odometria da base no state (20 dims).
-    # Ação com 9 dims: 6 juntas + garra + cmd_vel.linear.x + cmd_vel.angular.z.
-    TrainConfig(
-        name="pi05_widowxai_base_inf_odom_full",
-        exp_name="pi05_base_inf_odom_full",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotWidowX2CamDataConfig(
-            repo_id="rafaeljose/base-inf_v21",
-            action_dim=9,
-            use_base_odom=True,
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=20_000,  # == num_train_steps
-            decay_lr=2.5e-6,
-        ),
-        optimizer=_optimizer.AdamW(
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=1e-10,
-            clip_gradient_norm=1,
-        ),
-        ema_decay=0.99,
-        batch_size=32,
-        num_workers=8,
-        num_train_steps=20_000,
-        log_interval=100,
-        save_interval=1_000,
-        keep_period=5_000,
-        wandb_enabled=True,
-        fsdp_devices=1,
-    ),
-    # Versão LoRA do config acima (mesmo dataset/state/ação), para caber numa RTX 4090 (24 GB).
-    TrainConfig(
-        name="pi05_widowxai_base_inf_odom_lora",
-        exp_name="pi05_base_inf_odom_lora",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotWidowX2CamDataConfig(
-            repo_id="rafaeljose/base-inf_v21",
-            action_dim=9,
-            use_base_odom=True,
-            # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=20_000,  # == num_train_steps
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
-            weight_decay=1e-10,
-            clip_gradient_norm=1,
-        ),
-        # Sem EMA: guardaria uma copia extra dos 3B de params na GPU.
-        ema_decay=None,
-        # Se ainda der OOM na 4090, baixe para 8 (--batch-size=8).
-        batch_size=16,
-        num_workers=4,
-        num_train_steps=20_000,
-        log_interval=100,
-        save_interval=1_000,
-        keep_period=5_000,
-        wandb_enabled=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        fsdp_devices=1,
-    ),
     #
     # Fine-tuning Libero configs.
     #
@@ -1445,6 +1317,209 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+
+    TrainConfig(
+            name="pi05_widowxai_pick_tote_table_inf_b16_w8_40kstep",
+            exp_name="pi05_widowxai_pick_tote_table_inf_b16_w8_40kstep",
+            model=pi0_config.Pi0Config(pi05=True), #, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="rafaeljose/base-inf_v21",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=16,
+            num_workers=8,
+            num_train_steps=40_000,
+            log_interval=100,
+            save_interval=10_000,
+            keep_period=9_000,
+            wandb_enabled=True,
+        ),
+
+
+    TrainConfig(
+            name="pi05_widowxai_pick_tote_table_inf_b32_w16",
+            exp_name="pi05_widowxai_pick_tote_table_inf_b32_w16",
+            model=pi0_config.Pi0Config(pi05=True), #, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="rafaeljose/base-inf_v21",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=10_000,
+            keep_period=9_000,
+            wandb_enabled=True,
+        ),
+
+    # Mesma receita do pick_tote_table_inf_b32_w16, nos datasets do red tote. Datasets pequenos (12k-27k frames):
+    # checkpoints mantidos a cada 5k passos para poder avaliar um anterior caso o final tenha overfit.
+    TrainConfig(
+            name="pi05_widowxai_pick_up_red_tote_b32_w16",
+            exp_name="pi05_widowxai_pick_up_red_tote_b32_w16",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/base-inf-pick-up-the-red-tote-from-the-table",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+        ),
+
+    TrainConfig(
+            name="pi05_widowxai_place_red_tote_b32_w16",
+            exp_name="pi05_widowxai_place_red_tote_b32_w16",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/base-inf-place-the-red-tote-on-the-white-table",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+        ),
+
+    TrainConfig(
+            name="pi05_widowxai_organize_table_inf",
+            exp_name="pi05_widowxai_organize_table_inf",
+            # Variantes "gemma_2b" / "gemma_300m" (default) -> todos os pesos treinaveis, sem adaptadores LoRA.
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXDataConfig(
+                repo_id="rafaeljose/table-inf_v21",
+                # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            # LR de pico menor que no LoRA: agora o backbone de 3B inteiro e atualizado.
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=2.5e-5,
+                decay_steps=20_000,  # == num_train_steps
+                decay_lr=2.5e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            # EMA ajuda a estabilizar o fine-tuning completo (default do openpi para full FT).
+            ema_decay=0.99,
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+            # Sem freeze_filter: nada congelado.
+            fsdp_devices=1,
+        ),
+
+TrainConfig(
+            name="pi05_widowxai_organize_table_inf_b16_w8_40kstep",
+            exp_name="pi05_widowxai_organize_table_inf_b16_w8_40kstep",
+            # Variantes "gemma_2b" / "gemma_300m" (default) -> todos os pesos treinaveis, sem adaptadores LoRA.
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXDataConfig(
+                repo_id="rafaeljose/table-inf_v21",
+                # sem assets= -> norm stats do proprio dataset (rode compute_norm_stats.py antes)
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            # LR de pico menor que no LoRA: agora o backbone de 3B inteiro e atualizado.
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=2.5e-5,
+                decay_steps=20_000,  # == num_train_steps
+                decay_lr=2.5e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            # EMA ajuda a estabilizar o fine-tuning completo (default do openpi para full FT).
+            ema_decay=0.99,
+            batch_size=16,
+            num_workers=8,
+            num_train_steps=40_000,
+            log_interval=100,
+            save_interval=5_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+            # Sem freeze_filter: nada congelado.
+            fsdp_devices=1,
+        ),
     #
     # Debugging configs.
     #
