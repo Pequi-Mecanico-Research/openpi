@@ -37,12 +37,16 @@ from openpi_client import websocket_client_policy
 from scipy.interpolate import PchipInterpolator
 
 from ros2_base_bridge import BaseVelocityBridge
+from ros2_camera_bridge import CameraImageBridge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Dimensões da base móvel no fim do vetor de ação: [cmd_vel (linear), ang_vel (angular)].
 BASE_ACTION_DIM = 2
+
+# Tópico que a interface web do manipulator_orchestration assina por padrão (camera:=topic).
+DEFAULT_CAMERA_TOPIC = "/table_arm/env_camera/image_raw"
 
 
 class TrossenOpenPIBridge:
@@ -56,6 +60,9 @@ class TrossenOpenPIBridge:
         test_mode: str = "autonomous",  # "autonomous" (arm), "autonomous_base" (arm + base) or "test"
         max_steps: int = 1000,
         base_topic: str = "/cmd_vel",
+        camera_topic: str = DEFAULT_CAMERA_TOPIC,  # "" = não publica imagem no ROS 2
+        camera_name: str = "cam_low",  # câmera de robot_config.cameras publicada em camera_topic
+        camera_max_hz: float = 10.0,
     ):
         self.control_frequency = control_frequency
         self.max_steps = max_steps
@@ -107,6 +114,21 @@ class TrossenOpenPIBridge:
 
         self.robot = make_robot_from_config(robot_config)
         self.robot.connect()
+
+        # Publica a imagem que o main.py já captura (a RealSense não pode ser aberta por outro processo ao mesmo tempo).
+        # Criada depois da base: as duas pontes compartilham o contexto do rclpy, que quem o criou encerra.
+        self.camera_name = camera_name
+        self.camera_bridge = None
+        self._camera_warned_at = 0.0
+        if camera_topic:
+            if camera_name not in self.robot.cameras:
+                raise ValueError(f"camera_name={camera_name!r} não está em {list(self.robot.cameras)}")
+            try:
+                self.camera_bridge = CameraImageBridge(
+                    topic=camera_topic, frame_id=camera_name, encoding="rgb8", max_hz=camera_max_hz
+                )
+            except ImportError:
+                logger.warning("ROS 2 (rclpy) não disponível: a imagem da câmera não será publicada em %s", camera_topic)
 
         self.current_action_chunk = None
         self.action_chunk_idx = 0
@@ -286,6 +308,8 @@ class TrossenOpenPIBridge:
                 # Request new action chunk after consuming the previous one
                 if self.current_action_chunk is None or self.action_chunk_idx >= self.rate_of_inference:
                     observation_dict = self.robot.get_observation()
+                    # Frame completo da observação, antes do resize/transposição abaixo.
+                    self._publish_camera(observation_dict.get(self.camera_name), force=True)
 
                     # Extract joint positions from observation
                     joint_pos_keys = [k for k in observation_dict.keys() if k.endswith(".pos")]
@@ -333,6 +357,9 @@ class TrossenOpenPIBridge:
 
                     self.action_chunk_idx = 0
                     logger.info(f"Received action chunk: {self.current_action_chunk.shape}")
+                else:
+                    # Entre observações (~1,7 s) mantém a imagem fresca no tópico, senão o painel a vê como congelada.
+                    self._publish_camera()
 
                 # Select action using temporal ensembling if enabled
                 ## TODO: Estudar mais sobre temporal_ensemble_coefficient
@@ -394,6 +421,22 @@ class TrossenOpenPIBridge:
             self.status["phase"] = "idle"
             logger.info(f"Episode completed after {self.episode_step} steps (reason: {stop_reason})")
 
+    def _publish_camera(self, frame: np.ndarray | None = None, force: bool = False):
+        """Publica a câmera no ROS 2. Nunca interrompe o loop de controle: falhas só viram aviso (no máx. a cada 5 s)."""
+        if self.camera_bridge is None or (frame is None and not self.camera_bridge.ready()):
+            return
+        try:
+            if frame is None:
+                frame = self.robot.cameras[self.camera_name].async_read(timeout_ms=10)  # não bloqueia o controle
+            self.camera_bridge.publish(frame, force=force)
+        except TimeoutError:
+            pass
+        except Exception as e:
+            now = time.monotonic()
+            if now - self._camera_warned_at > 5.0:
+                self._camera_warned_at = now
+                logger.warning(f"Could not publish {self.camera_name} to ROS 2: {e!r}")
+
     def _get_weights(self, num_preds: int) -> np.ndarray:
         weights = np.exp(-self.temporal_ensemble_coefficient * np.arange(num_preds))
         return weights / weights.sum()
@@ -406,6 +449,8 @@ class TrossenOpenPIBridge:
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
+        if self.camera_bridge is not None:
+            self.camera_bridge.close()  # antes da base: ela encerra o contexto do rclpy
         if self.base is not None:
             self.base.close()
         self.robot.disconnect()
@@ -425,6 +470,13 @@ if __name__ == "__main__":
     parser.add_argument("--task_prompt", default="move the arm to the left", help="Task description for the policy")
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
     parser.add_argument("--base_topic", default="/cmd_vel", help="ROS 2 geometry_msgs/Twist topic of the mobile base")
+    parser.add_argument(
+        "--camera_topic",
+        default=DEFAULT_CAMERA_TOPIC,
+        help="ROS 2 sensor_msgs/Image topic to publish a camera on (empty string = off; skipped if ROS 2 is not installed)",
+    )
+    parser.add_argument("--camera_name", default="cam_low", help="Camera from the robot config published on --camera_topic")
+    parser.add_argument("--camera_max_hz", type=float, default=10.0, help="Max publish rate of --camera_topic")
     args = parser.parse_args()
 
     bridge = TrossenOpenPIBridge(
@@ -434,6 +486,9 @@ if __name__ == "__main__":
         test_mode=args.mode,
         max_steps=args.max_steps,
         base_topic=args.base_topic,
+        camera_topic=args.camera_topic,
+        camera_name=args.camera_name,
+        camera_max_hz=args.camera_max_hz,
     )
     
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0)) if args.mode == "autonomous_base" else None
