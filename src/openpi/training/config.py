@@ -1445,6 +1445,70 @@ _CONFIGS = [
             wandb_enabled=True,
         ),
 
+    # Mesma receita, no dataset day2 (17 episodios, 27k frames; convertido de v3.0 para v2.1).
+    TrainConfig(
+            name="pi05_widowxai_day2_pick_place_b32_w16",
+            exp_name="pi05_widowxai_day2_pick_place_b32_w16",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/day2-base-inf-pick-place",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+        ),
+
+    # Mesma receita, no dataset pick-and-place merged (52 episodios, 87k frames).
+    TrainConfig(
+            name="pi05_widowxai_inf_base_pick_place_merged_b32_w16",
+            exp_name="pi05_widowxai_inf_base_pick_place_merged_b32_w16",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/inf-base-pick-place-merged",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=20_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=20_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=5_000,
+            wandb_enabled=True,
+        ),
+
     TrainConfig(
             name="pi05_widowxai_organize_table_inf",
             exp_name="pi05_widowxai_organize_table_inf",
