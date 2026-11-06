@@ -1509,6 +1509,39 @@ _CONFIGS = [
             wandb_enabled=True,
         ),
 
+    # Mesmo dataset merged, com 40k passos (cosine decay ajustado para 40k).
+    # Checkpoints mantidos a cada 10k (10k, 20k, 30k + final) para caber na cota de disco.
+    TrainConfig(
+            name="pi05_widowxai_inf_base_pick_place_merged_b32_40k",
+            exp_name="pi05_widowxai_inf_base_pick_place_merged_b32_40k",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/inf-base-pick-place-merged",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=40_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=40_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=10_000,
+            wandb_enabled=True,
+        ),
+
     TrainConfig(
             name="pi05_widowxai_organize_table_inf",
             exp_name="pi05_widowxai_organize_table_inf",
