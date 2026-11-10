@@ -401,6 +401,12 @@ class LeRobotWidowXWithMovelBaseDataConfig(DataConfigFactory):
     9 DOF: 6 juntas + garra + cmd_vel + ang_vel).
     """
 
+    # Se True, as 6 juntas viram delta em relacao ao state do inicio do chunk (acao[t] - state[0]).
+    # A garra continua absoluta e cmd_vel/ang_vel (dims 7-8, velocidades da base) ficam como estao.
+    # Na inferencia, o AbsoluteActions soma o state de volta: o robo continua recebendo acoes absolutas.
+    # Mudar isso exige recalcular as norm stats (a normalizacao acontece depois da conversao para delta).
+    use_delta_joint_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -421,9 +427,16 @@ class LeRobotWidowXWithMovelBaseDataConfig(DataConfigFactory):
             inputs=[widowx_policy.WidowXBaseInputs(model_type=model_config.model_type)],
             outputs=[widowx_policy.WidowXBaseOutputs()],
         )
- 
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)  # 6 juntas delta, garra absoluta
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
         model_transforms = ModelTransformFactory()(model_config)
- 
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -1506,6 +1519,41 @@ _CONFIGS = [
             log_interval=100,
             save_interval=1_000,
             keep_period=5_000,
+            wandb_enabled=True,
+        ),
+
+    # Merged com acoes delta nas 6 juntas (padrao do openpi/pi0), 30k passos.
+    # Checkpoints mantidos a cada 10k (10k, 20k + final 29999).
+    # Norm stats proprias (calculadas sobre as acoes delta). Na inferencia, servir com ESTE config.
+    TrainConfig(
+            name="pi05_widowxai_inf_base_pick_place_merged_b32_w16_delta",
+            exp_name="pi05_widowxai_inf_base_pick_place_merged_b32_w16_delta",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXWithMovelBaseDataConfig(
+                repo_id="gpettro/inf-base-pick-place-merged",
+                base_config=DataConfig(prompt_from_task=True),
+                use_delta_joint_actions=True,
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=5e-5,
+                decay_steps=30_000,   # == num_train_steps
+                decay_lr=1e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=30_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=10_000,
             wandb_enabled=True,
         ),
 
