@@ -18,7 +18,9 @@ Usage:
 
 import argparse
 from collections import defaultdict
+import csv
 import logging
+import threading
 import time
 
 import cv2
@@ -107,6 +109,13 @@ class TrossenOpenPIBridge:
 
         self.action_dim = len(self.robot.action_features)  # action_features = 7 dims per arm (6 joints + gripper) * 2 arms = 14
 
+        # Acceleration log used to compute jerk (see start_acceleration_log / save_acceleration_log)
+        self._accel_samples = []  # (t, [accelerations])
+        self._accel_events = []  # (t, name)
+        self._accel_t0 = None
+        self._accel_stop = threading.Event()
+        self._accel_thread = None
+
     def execute_action(self, action: np.ndarray):
         """Execute action on the arm."""
         full_action = action.copy()
@@ -147,6 +156,28 @@ class TrossenOpenPIBridge:
         while time.time() < end_time:
             loop_start_time = time.time()
             current_time = loop_start_time - start_time
+            positions = interpolator_position(current_time)
+            self.execute_action(positions)
+
+    def blend_pi05_inference(
+        self, previous_keyframe: np.ndarray, next_keyframe: np.ndarray, blend_duration: float = 0.5
+    ):
+        """Smoothly move the arm between the last keyframe actually executed from the outgoing
+        action chunk and the first keyframe of the newly inferred chunk. Avoids the jerk caused by
+        snapping directly between two independently inferred chunks. Uses the same PCHIP
+        interpolation pattern as move_to_start_position, but over a much shorter duration.
+        blend_duration should stay comfortably above the arm driver's own per-call ramp time
+        (min_time_to_move_multiplier / loop_rate, ~0.13s with this bridge's config) since each
+        execute_action call here also gets its own firmware-level ramp to the target."""
+        waypoints = np.array([previous_keyframe, next_keyframe])
+        timepoints = np.array([0, blend_duration])
+        interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+
+        start_time = time.time()
+        end_time = start_time + timepoints[-1]
+
+        while time.time() < end_time:
+            current_time = time.time() - start_time
             positions = interpolator_position(current_time)
             self.execute_action(positions)
 
@@ -197,7 +228,15 @@ class TrossenOpenPIBridge:
 
                 logger.info(f"Step {self.episode_step}: Requesting new action chunk")
                 # Momento da inferência feita ao modelo do pi05
+                self._mark_event("infer_start")
                 response = self.policy_client.infer(observation)
+                self._mark_event("infer_end")
+                if self.current_action_chunk is not None:
+                    previous_keyframe = self.current_action_chunk[self.action_chunk_idx - 1]
+                    next_keyframe = response["actions"][0]
+                    self._mark_event("blend_start")
+                    self.blend_pi05_inference(previous_keyframe, next_keyframe)
+                    self._mark_event("blend_end")
                 self.current_action_chunk = response["actions"]
                 chunk_len = self.current_action_chunk.shape[0]  # actual chunk length returned by the policy
 
@@ -252,6 +291,72 @@ class TrossenOpenPIBridge:
         logger.info("Starting autonomous mode")
         self.run_episode(task_prompt=task_prompt)
 
+    def start_acceleration_log(self, sample_rate: float = 100.0):
+        """Start sampling the joint accelerations measured by the arm driver in a background thread.
+        Runs independently of the control loop, so the arm is also recorded while the loop is
+        blocked waiting for a policy inference. Only reads the driver, never sends commands."""
+        self._accel_samples = []
+        self._accel_events = []
+        self._accel_t0 = time.perf_counter()
+        self._accel_stop.clear()
+        self._accel_thread = threading.Thread(
+            target=self._acceleration_log_loop, args=(1.0 / sample_rate,), daemon=True
+        )
+        self._accel_thread.start()
+        logger.info(f"Acceleration log started at {sample_rate:.0f} Hz")
+
+    def _acceleration_log_loop(self, period: float):
+        next_t = time.perf_counter()
+        while not self._accel_stop.is_set():
+            try:
+                accelerations = list(self.robot.driver.get_all_accelerations())
+            except Exception:
+                # The driver rethrows its errors on whichever call comes next, which may be this one
+                # instead of the control loop's: stop the episode so the error is not missed
+                logger.exception("Arm driver error while logging accelerations, stopping the episode")
+                self.is_running = False
+                return
+            self._accel_samples.append((time.perf_counter() - self._accel_t0, accelerations))
+            next_t += period
+            now = time.perf_counter()
+            if next_t <= now:
+                # Late: wait a full period instead of reading again right away. Two back-to-back
+                # samples would have a tiny dt and show up as a spurious jerk spike in da/dt
+                next_t = now + period
+            time.sleep(next_t - now)
+
+    def _mark_event(self, name: str):
+        """Timestamp an event (inference / blend) in the acceleration log, if it is running."""
+        if self._accel_thread is not None:
+            self._accel_events.append((time.perf_counter() - self._accel_t0, name))
+
+    def save_acceleration_log(self, csv_path: str):
+        """Stop the acceleration log and save it as CSV (time + accelerations of each joint, plus
+        the inference/blend events). Jerk is the time derivative of these accelerations, j = da/dt,
+        computed afterwards by analyze_jerk.py."""
+        if self._accel_thread is None:
+            logger.warning("Acceleration log was not started, nothing to save")
+            return
+        self._accel_stop.set()
+        self._accel_thread.join()
+        self._accel_thread = None
+
+        joint_names = list(self.robot.config.joint_names)
+        times = [t for t, _ in self._accel_samples]
+
+        # Each event goes on the first sample taken at or after it
+        events_per_row = defaultdict(list)
+        for event_t, name in self._accel_events:
+            row = int(np.searchsorted(times, event_t))
+            events_per_row[min(row, len(times) - 1)].append(name)
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["t", *(f"{name}.acc" for name in joint_names), "event"])
+            for i, (t, accelerations) in enumerate(self._accel_samples):
+                writer.writerow([f"{t:.6f}", *(f"{a:.6f}" for a in accelerations), ";".join(events_per_row[i])])
+        logger.info(f"Acceleration log saved to {csv_path} ({len(times)} samples, {len(self._accel_events)} events)")
+
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
@@ -271,6 +376,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--task_prompt", default="move the arm to the left", help="Task description for the policy")
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
+    parser.add_argument(
+        "--accel_log", default=None, help="Save the joint accelerations to this .csv to compute jerk"
+    )
     args = parser.parse_args()
 
     bridge = TrossenOpenPIBridge(
@@ -281,9 +389,14 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
     )
 
+    if args.accel_log:
+        bridge.start_acceleration_log()
+
     try:
         bridge.autonomous_mode(task_prompt=args.task_prompt)
     except KeyboardInterrupt:
         logger.info("Interrupted by user, returning arm to start position...")
     finally:
+        if args.accel_log:
+            bridge.save_acceleration_log(args.accel_log)
         bridge.cleanup()
