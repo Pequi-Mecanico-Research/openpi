@@ -361,6 +361,11 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
     Config de dados para o dataset WidowX AI (3 câmeras: cam_high, cam_wrist, cam_low; 7 DOF).
     """
 
+    # Se True, as 6 juntas viram delta em relacao ao state do inicio do chunk (acao[t] - state[0]); garra absoluta.
+    # Na inferencia, o AbsoluteActions soma o state de volta: o robo continua recebendo acoes absolutas.
+    # Mudar isso exige recalcular as norm stats (a normalizacao acontece depois da conversao para delta).
+    use_delta_joint_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -382,7 +387,14 @@ class LeRobotWidowXDataConfig(DataConfigFactory):
             inputs=[widowx_policy.WidowXBaseInputs(model_type=model_config.model_type)],
             outputs=[widowx_policy.WidowXOutputs()],
         )
- 
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)  # 6 juntas delta, garra absoluta
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
         model_transforms = ModelTransformFactory()(model_config)
  
         return dataclasses.replace(
@@ -1625,6 +1637,43 @@ _CONFIGS = [
             keep_period=5_000,
             wandb_enabled=True,
             # Sem freeze_filter: nada congelado.
+            fsdp_devices=1,
+        ),
+
+    # Mesmo do pi05_widowxai_organize_table_inf (Rafael, dataset na mesa), mas com acoes delta nas 6 juntas
+    # e 30k passos. Checkpoints mantidos a cada 10k (10k, 20k + final 29999).
+    # Norm stats proprias (calculadas sobre as acoes delta). Na inferencia, servir com ESTE config.
+    TrainConfig(
+            name="pi05_widowxai_organize_table_inf_b32_w16_30k_delta",
+            exp_name="pi05_widowxai_organize_table_inf_b32_w16_30k_delta",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotWidowXDataConfig(
+                repo_id="rafaeljose/table-inf_v21",
+                base_config=DataConfig(prompt_from_task=True),
+                use_delta_joint_actions=True,
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=2.5e-5,
+                decay_steps=30_000,  # == num_train_steps
+                decay_lr=2.5e-6,
+            ),
+            optimizer=_optimizer.AdamW(
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=1e-10,
+                clip_gradient_norm=1,
+            ),
+            ema_decay=0.99,
+            batch_size=32,
+            num_workers=16,
+            num_train_steps=30_000,
+            log_interval=100,
+            save_interval=1_000,
+            keep_period=10_000,
+            wandb_enabled=True,
             fsdp_devices=1,
         ),
 
