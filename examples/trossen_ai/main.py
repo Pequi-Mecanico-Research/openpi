@@ -28,13 +28,24 @@ import threading
 import time
 
 import cv2
+import numpy as np
+from lerobot.cameras.configs import ColorMode
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.robots import make_robot_from_config
 from lerobot_robot_trossen.config_widowxai_follower import WidowXAIFollowerConfig
 from lerobot_robot_trossen.config_bi_widowxai_follower import BiWidowXAIFollowerRobotConfig
-import numpy as np
 from openpi_client import websocket_client_policy
 from scipy.interpolate import PchipInterpolator
+from datetime import datetime
+from pathlib import Path
+from eval_vla.config import SetupConfig
+from eval_vla.metrics.failure_analysis import FailureAnalysis
+from eval_vla.metrics.long_horizon import LongHorizon
+from eval_vla.metrics.operation import Operation
+from eval_vla.metrics.statistical import Statistical
+from eval_vla.vision.camera import Camera, load_image
+from eval_vla.vision.roi_selector import RoiSelector
+from eval_vla.vision.viewer import make_viewer
 
 from ros2_base_bridge import BaseVelocityBridge
 
@@ -43,6 +54,62 @@ logger = logging.getLogger(__name__)
 
 # Dimensões da base móvel no fim do vetor de ação: [cmd_vel (linear), ang_vel (angular)].
 BASE_ACTION_DIM = 2
+
+
+class _RealSenseCapture:
+    """Mimics the subset of `cv2.VideoCapture` that `eval_vla.vision.camera.Camera` uses, on top of a
+    RealSense already connected by LeRobot. The robot keeps ownership of the device: `release()` is a no-op."""
+
+    def __init__(self, rs_camera, timeout_ms: float = 500):
+        self._cam = rs_camera
+        self._timeout_ms = timeout_ms
+        self._last: np.ndarray | None = None
+
+    def isOpened(self) -> bool:
+        return self._cam.is_connected
+
+    def read(self):
+        try:
+            frame = self._cam.async_read(timeout_ms=self._timeout_ms)
+        except Exception:
+            logger.exception("Could not read a frame from the RealSense camera")
+            return False, None
+        # LeRobot returns RGB by default; eval_vla (cv2.imwrite / VideoWriter / segmentation) expects BGR.
+        if self._cam.config.color_mode == ColorMode.RGB:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return True, frame
+
+    def grab(self) -> bool:
+        ok, self._last = self.read()
+        return ok
+
+    def retrieve(self):
+        return self._last is not None, self._last
+
+    def get(self, prop: int) -> float:
+        return {
+            cv2.CAP_PROP_FPS: self._cam.fps,
+            cv2.CAP_PROP_FRAME_WIDTH: self._cam.width,
+            cv2.CAP_PROP_FRAME_HEIGHT: self._cam.height,
+        }.get(prop, 0.0)
+
+    def release(self) -> None:
+        pass
+
+
+class RealSenseEvalCamera(Camera):
+    """`eval_vla` Camera (capture, recording, preview) that reads from the robot's RealSense instead of
+    opening a second device with OpenCV."""
+
+    def __init__(self, rs_camera):
+        super().__init__(device="cam_high", warmup_frames=0)
+        self._rs_camera = rs_camera
+
+    def open(self) -> "RealSenseEvalCamera":
+        self._capture = _RealSenseCapture(self._rs_camera)
+        if not self._capture.isOpened():
+            raise RuntimeError("The robot's RealSense camera is not connected; call robot.connect() first")
+        return self
 
 
 class TrossenOpenPIBridge:
@@ -56,6 +123,8 @@ class TrossenOpenPIBridge:
         test_mode: str = "autonomous",  # "autonomous" (arm), "autonomous_base" (arm + base) or "test"
         max_steps: int = 1000,
         base_topic: str = "/cmd_vel",
+        n_episodes: int = 10,
+        task_prompt: str = "Organize_the_table"
     ):
         self.control_frequency = control_frequency
         self.max_steps = max_steps
@@ -150,6 +219,51 @@ class TrossenOpenPIBridge:
         self.arm_action_dim = len(self.robot.action_features)  # 7 dims (6 joints + gripper)
         self.action_dim = self.arm_action_dim + BASE_ACTION_DIM  # + cmd_vel e ang_vel da base
 
+        if test_mode == "evaluation":
+            CALIBRATION_DIR = Path(__file__).resolve().parents[1] / "calibration"
+            self.task_name = task_prompt
+
+            self.eval_config = SetupConfig(
+                robot_embodiment={"manufacturer": "Trossen", "model": "WidowX", "dof": 6, "end_effector": "Precision Gripper"},
+                camera_configuration={"count": 3, "positions": ["wrist", "low", "high"], "resolution": [640, 480]},
+                action_space={"type": "end_effector_pose", "dim": 7},
+                control_frequency=self.rate_of_inference,
+                object_set={"count": 1, "materials": ["PLA"], "seen_in_training": True},
+                scene_layout={"workspace_m": "White Table", "lighting": "indoor"},
+                reset_procedure="VLA",
+                success_criteria="objects inside the tots",
+                model_name="pi05_organize_cube_with_effort",
+                experiment_name="Openpi_Eval",
+                task_name=self.task_name,
+                perturbation_type=None,  # list of: object, layout, camera, lighting, background, initial_state, sensor_noise
+            )
+
+            self.n_episodes = n_episodes
+            self.run_dir = Path("eval_results") / f"{self.eval_config.experiment_name}_{datetime.now():%d-%m_%H:%M:%S}"
+            self.eval_object_prompts = ["Cube", "White Cube", "Green cube"]
+            self.eval_window_s = 30.0
+            self.eval_debug_video = False
+
+            self.eval_stats = Statistical(self.eval_config, run_dir=self.run_dir, name="statistical")
+            self.eval_operation = Operation(self.eval_config, episodes=n_episodes, run_dir=self.run_dir, name="operation")
+            self.eval_long_horizon = LongHorizon(self.eval_config, run_dir=self.run_dir, name="long_horizon")
+
+            # Reuses the RealSense "cam_high" already connected by the robot instead of opening another device.
+            self.eval_camera = RealSenseEvalCamera(self.robot.cameras["cam_high"]).open()
+            self.eval_view = make_viewer("rerun", self.eval_camera)
+
+            reference_path = CALIBRATION_DIR / self.task_name / "reference.png"
+
+            def get_reference_image() -> np.ndarray:
+                if reference_path.exists():
+                    return load_image(reference_path)
+                return self.eval_camera.capture(reference_path, countdown_s=2)
+
+            self.eval_rois = RoiSelector.load_or_create(
+                CALIBRATION_DIR / self.task_name / "rois.json", ["table", "container"], get_reference_image
+            )
+
+
     def execute_action(self, action: np.ndarray):
         """Execute action on the arm and, if the action includes it, on the mobile base."""
         full_action = action.copy()
@@ -161,7 +275,7 @@ class TrossenOpenPIBridge:
             if base_action.size == BASE_ACTION_DIM:
                 logger.info(f"TEST MODE: Would publish base cmd_vel={base_action[0]:.4f} ang_vel={base_action[1]:.4f}")
             return
-        if self.test_mode in ("autonomous", "autonomous_base"):
+        if self.test_mode in ("autonomous", "autonomous_base", "evaluation"):
             joint_features = list(self.robot.action_features.keys())
             action_dict = {k: arm_action[i] for i, k in enumerate(joint_features)}
             self.robot.send_action(action_dict)
@@ -252,6 +366,8 @@ class TrossenOpenPIBridge:
         self.abort_requested.clear()
         self.task_prompt = task_prompt
         is_first_step = True
+        if self.test_mode == "evaluation":
+            self.eval_stats.inference_latency_sec_list = []  # latencies are accumulated per episode
 
         self._episode_counter += 1
         history_entry = {
@@ -318,7 +434,14 @@ class TrossenOpenPIBridge:
 
                     logger.info(f"Step {self.episode_step}: Requesting new action chunk")
                     # Momento da inferência feita ao modelo do pi05
+                    inference_start = time.perf_counter()
                     response = self.policy_client.infer(observation)
+                    if self.test_mode == "evaluation":
+                        self.eval_stats.inference_latency(
+                            inference_start,
+                            time.perf_counter(),
+                            steps_per_episode=-(-self.max_steps // self.rate_of_inference),  # ceil: inferences per episode
+                        )
                     if self.current_action_chunk is not None:
                         previous_keyframe = self.current_action_chunk[self.action_chunk_idx - 1]
                         next_keyframe = response["actions"][0]
@@ -352,6 +475,9 @@ class TrossenOpenPIBridge:
                     is_first_step = False
                 else:
                     self.execute_action(a_t)
+
+                if self.test_mode == "evaluation":
+                    self._eval_step_metrics()
 
                 self.action_chunk_idx += 1
                 self.episode_step += 1
@@ -398,14 +524,87 @@ class TrossenOpenPIBridge:
         weights = np.exp(-self.temporal_ensemble_coefficient * np.arange(num_preds))
         return weights / weights.sum()
 
+
+    def _eval_step_metrics(self):
+        """Per-control-step evaluation metrics: collision (GMO), jerk and live plots in the viewer."""
+        driver = self.robot.driver
+        joint_names = self.robot.config.joint_names
+        operation = self.eval_operation
+
+        external_efforts = dict(zip(joint_names, (round(e, 2) for e in driver.get_all_external_efforts())))
+        operation.collision_rate(driver, mode="gmo")
+        operation.jerks_rate(driver)
+
+        self.eval_view.update(
+            external_effort=external_efforts,
+            gmo_residual=dict(zip(joint_names, operation.gmo_residual)),
+            jerk_peaks=dict(zip([*joint_names, "linear", "angular"], operation.jerks_peaks)),
+        )
+
+
+    def run_evaluation(self, task_prompt: str):
+        """Run `n_episodes` episodes, computing the Eval_VLA metrics for each one and generating the final graphs."""
+        stats, operation, long_horizon = self.eval_stats, self.eval_operation, self.eval_long_horizon
+        camera, view, run_dir = self.eval_camera, self.eval_view, self.run_dir
+        start_eval_time = time.perf_counter()
+
+        for ep in range(self.n_episodes):
+            video_path = run_dir / f"ep{ep}.mp4"
+            before_frame = camera.capture(run_dir / f"ep{ep}_before.png")
+            camera.start_recording(video_path, preview=view.preview)
+
+            start_time = time.perf_counter()
+
+            self.run_episode(task_prompt=task_prompt)
+
+            stats.task_completion_time(start_time, time.perf_counter())
+            after_frame = camera.capture(run_dir / f"ep{ep}_after.png")
+            camera.stop_recording()
+
+            stats.success_rate(
+                self.task_name, "model_segmentation", before_frame, after_frame,
+                prompt=self.eval_object_prompts, rois=self.eval_rois, model="sam3",
+            )
+
+            operation.reset_failure_rate(self.robot.driver)
+            operation.human_intervention_rate(video_path, prompt=["hand", "human arm"], model="sam3")
+
+            subtasks_completed = [bool(stats.success_rate_value)]
+            long_horizon.subtask_completion_rate(subtasks_completed)
+            long_horizon.average_completed_sequence_length(subtasks_completed)
+            long_horizon.failure_position_distribution(subtasks_completed)
+
+            stats.end_episode()
+            operation.end_episode()
+            long_horizon.end_episode()
+
+            if not stats.success_rate_value:
+                analysis = FailureAnalysis(
+                    self.eval_config, video_path, window_s=self.eval_window_s,
+                    debug_video=self.eval_debug_video, run_dir=run_dir, name="failure_analysis",
+                )
+                logger.info(f"Episode {ep} failure type: {analysis.failure_type}")
+                analysis.end_episode(episode=ep + 1)
+
+        logger.info(f"Final eval time: {time.perf_counter() - start_eval_time:.3f} s")
+        logger.info(f"Results and graphs in {run_dir}")
+
+
     def autonomous_mode(self, task_prompt: str = "look down"):
         """Run in autonomous mode where the arm executes policy predictions."""
         logger.info("Starting autonomous mode")
-        self.run_episode(task_prompt=task_prompt)
+        if self.test_mode == "evaluation":
+            self.run_evaluation(task_prompt)
+        else:
+            self.run_episode(task_prompt=task_prompt)
+
 
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
+        if self.test_mode == "evaluation":
+            self.eval_view.close()
+            self.eval_camera.close()  # stops any recording; the RealSense itself is released by robot.disconnect()
         if self.base is not None:
             self.base.close()
         self.robot.disconnect()
@@ -418,13 +617,14 @@ if __name__ == "__main__":
     parser.add_argument("--control_freq", type=int, default=30, help="Control frequency in Hz")
     parser.add_argument(
         "--mode",
-        choices=["autonomous", "autonomous_base", "test"],
+        choices=["autonomous", "autonomous_base", "test", "evaluation"],
         default="autonomous",
         help="Operation mode: autonomous (arm only), autonomous_base (arm + mobile base) or test (no movement)",
     )
     parser.add_argument("--task_prompt", default="move the arm to the left", help="Task description for the policy")
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
     parser.add_argument("--base_topic", default="/cmd_vel", help="ROS 2 geometry_msgs/Twist topic of the mobile base")
+    parser.add_argument("--n_episodes", type=int, default=10, help="Number of episodes to run in eval")
     args = parser.parse_args()
 
     bridge = TrossenOpenPIBridge(
@@ -434,6 +634,8 @@ if __name__ == "__main__":
         test_mode=args.mode,
         max_steps=args.max_steps,
         base_topic=args.base_topic,
+        n_episodes=args.n_episodes,
+        task_prompt=args.task_prompt
     )
     
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0)) if args.mode == "autonomous_base" else None
